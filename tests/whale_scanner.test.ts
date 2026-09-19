@@ -3,6 +3,19 @@ import path from 'path';
 import fs from 'fs';
 import { WhaleDB } from '../src/whales/whale_db';
 import { WhaleScanner } from '../src/whales/whale_scanner';
+
+/* ── Runner-agnostic global stubbing ──
+   vi.stubGlobal is a vitest-only API, so the whole file fails under any
+   other runner. Assigning globalThis.fetch directly works everywhere and
+   stubs exactly the same thing. */
+const REAL_FETCH = globalThis.fetch;
+function stubFetch(impl: unknown): void {
+  (globalThis as { fetch: unknown }).fetch = impl;
+}
+function restoreFetch(): void {
+  (globalThis as { fetch: unknown }).fetch = REAL_FETCH;
+}
+
 import {
   DEFAULT_WHALE_CONFIG,
   type WhaleTrackingConfig,
@@ -14,6 +27,14 @@ import {
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
 const TEST_DB_PATH = path.join(__dirname, '.test_scanner.db');
+
+/** WAL mode writes -wal and -shm beside the database; all three must go. */
+function removeDb(): void {
+  for (const suffix of ['', '-wal', '-shm']) {
+    const f = TEST_DB_PATH + suffix;
+    if (fs.existsSync(f)) fs.unlinkSync(f);
+  }
+}
 
 function makeScannerConfig(overrides: Partial<ScannerConfig> = {}): ScannerConfig {
   return {
@@ -82,13 +103,13 @@ function clobTrades(marketId: string, addressCount = 5, tradesPerAddr = 10) {
 let db: WhaleDB;
 
 beforeEach(() => {
-  if (fs.existsSync(TEST_DB_PATH)) fs.unlinkSync(TEST_DB_PATH);
+  removeDb();
   db = new WhaleDB(TEST_DB_PATH);
 });
 
 afterEach(() => {
   db.close();
-  if (fs.existsSync(TEST_DB_PATH)) fs.unlinkSync(TEST_DB_PATH);
+  removeDb();
 });
 
 describe('WhaleScanner — Lifecycle', () => {
@@ -104,7 +125,7 @@ describe('WhaleScanner — Lifecycle', () => {
 
   it('start sets enabled=true and status=idle', () => {
     // Stub fetch so the immediate scan in start() doesn't make real requests
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+    stubFetch(vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve([]),
     }));
@@ -117,11 +138,11 @@ describe('WhaleScanner — Lifecycle', () => {
     expect(['idle', 'scanning']).toContain(state.status);
     scanner.stop();
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 
   it('stop disables and clears state', () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+    stubFetch(vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve([]),
     }));
@@ -133,11 +154,11 @@ describe('WhaleScanner — Lifecycle', () => {
     expect(state.enabled).toBe(false);
     expect(state.status).toBe('idle');
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 
   it('toggle flips enabled state', () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+    stubFetch(vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve([]),
     }));
@@ -151,7 +172,7 @@ describe('WhaleScanner — Lifecycle', () => {
     scanner.toggle();
     expect(scanner.isEnabled()).toBe(false);
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 
   it('getState returns a copy (mutations do not leak)', () => {
@@ -170,7 +191,7 @@ describe('WhaleScanner — triggerScan (with mock fetch)', () => {
     const trades1 = clobTrades('0xcond_market_1', 2, 6);
 
     let callIndex = 0;
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       callIndex++;
       if (url.includes('/markets')) {
         return { ok: true, json: () => Promise.resolve(markets) };
@@ -219,11 +240,11 @@ describe('WhaleScanner — triggerScan (with mock fetch)', () => {
       expect(profiles[i - 1].compositeScore).toBeGreaterThanOrEqual(profiles[i].compositeScore);
     }
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 
   it('returns empty profiles when no liquid markets found', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+    stubFetch(vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve([]),
     }));
@@ -232,11 +253,11 @@ describe('WhaleScanner — triggerScan (with mock fetch)', () => {
     const profiles = await scanner.triggerScan();
     expect(profiles).toEqual([]);
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 
   it('handles fetch failure gracefully (stays idle with empty results)', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network failure')));
+    stubFetch(vi.fn().mockRejectedValue(new Error('network failure')));
 
     const config = makeConfig();
     const scanner = new WhaleScanner(db, config, 'https://gamma.test', 'https://clob.test');
@@ -248,14 +269,14 @@ describe('WhaleScanner — triggerScan (with mock fetch)', () => {
     expect(['idle', 'paused']).toContain(state.status);
     expect(state.marketsScanned).toBe(0);
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   }, 15_000);
 
   it('enters error state on unexpected internal error', async () => {
     const markets = gammaMarkets(1);
 
     // Return valid markets, but a broken response for trades that causes a parse error
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) return { ok: true, json: () => Promise.resolve(markets) };
       // Return an object whose json() throws
       return { ok: true, json: () => { throw new Error('corrupt response'); } };
@@ -270,14 +291,14 @@ describe('WhaleScanner — triggerScan (with mock fetch)', () => {
     expect(state.status).toBe('error');
     expect(state.lastError).toBeTruthy();
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   }, 15_000);
 
   it('getResults returns profiles after a scan', async () => {
     const markets = gammaMarkets(1);
     const trades = clobTrades('0xcond_market_0', 2, 5);
 
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) {
         return { ok: true, json: () => Promise.resolve(markets) };
       }
@@ -294,7 +315,7 @@ describe('WhaleScanner — triggerScan (with mock fetch)', () => {
       expect.objectContaining({ address: expect.any(String) }),
     ]));
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 });
 
@@ -329,7 +350,7 @@ describe('WhaleScanner — Profile fields', () => {
       trade({ id: 'tx2', market: 'market_0', side: 'SELL', size: 100, price: 0.70, timestamp: nowSec + 60, owner: addr }),
     ];
 
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) return { ok: true, json: () => Promise.resolve(markets) };
       return { ok: true, json: () => Promise.resolve(trades) };
     }));
@@ -342,7 +363,7 @@ describe('WhaleScanner — Profile fields', () => {
     expect(match).toBeDefined();
     expect(match!.alreadyTracked).toBe(true);
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 
   it('computes per-market breakdown', async () => {
@@ -356,7 +377,7 @@ describe('WhaleScanner — Profile fields', () => {
       trade({ id: 'tx2', market: 'market_1', side: 'BUY', size: 80, price: 0.60, timestamp: nowSec, owner: addr }),
     ];
 
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) return { ok: true, json: () => Promise.resolve(markets) };
       if (url.includes('market=0xcond_market_0')) return { ok: true, json: () => Promise.resolve(trades0) };
       if (url.includes('market=0xcond_market_1')) return { ok: true, json: () => Promise.resolve(trades1) };
@@ -377,7 +398,7 @@ describe('WhaleScanner — Profile fields', () => {
       expect(['BUY', 'SELL', 'NEUTRAL']).toContain(mb.netSide);
     }
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 
   it('infers tags based on behaviour', async () => {
@@ -393,7 +414,7 @@ describe('WhaleScanner — Profile fields', () => {
       );
     }
 
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) return { ok: true, json: () => Promise.resolve(markets) };
       return { ok: true, json: () => Promise.resolve(trades) };
     }));
@@ -408,7 +429,8 @@ describe('WhaleScanner — Profile fields', () => {
     expect(match!.suggestedTags).toContain('aggressive_buyer');
     expect(match!.suggestedTags).toContain('frequent_trader');
 
-    vi.unstubAllGlobals();
+
+    restoreFetch();
   });
 });
 
@@ -424,7 +446,7 @@ describe('WhaleScanner — Auto-promote', () => {
       trade({ id: `s${i}`, market: 'market_0', side: 'SELL', size: 200, price: 0.70, timestamp: nowSec - (9 - i * 2) * 60, owner: addr }),
     ]).flat();
 
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) return { ok: true, json: () => Promise.resolve(markets) };
       return { ok: true, json: () => Promise.resolve(trades) };
     }));
@@ -447,7 +469,7 @@ describe('WhaleScanner — Auto-promote', () => {
     expect(whale).toBeDefined();
     expect(whale!.tags).toContain('scanner_discovered');
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 
   it('does not promote when autoPromoteEnabled is false', async () => {
@@ -459,7 +481,7 @@ describe('WhaleScanner — Auto-promote', () => {
       trade({ id: 's1', market: 'market_0', side: 'SELL', size: 200, price: 0.70, timestamp: nowSec + 60, owner: addr }),
     ];
 
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) return { ok: true, json: () => Promise.resolve(markets) };
       return { ok: true, json: () => Promise.resolve(trades) };
     }));
@@ -476,7 +498,7 @@ describe('WhaleScanner — Auto-promote', () => {
     const whale = db.getWhaleByAddress(addr.toLowerCase());
     expect(whale).toBeUndefined();
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 
   it('respects autoPromoteMaxPerScan limit', async () => {
@@ -494,7 +516,7 @@ describe('WhaleScanner — Auto-promote', () => {
       }
     }
 
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) return { ok: true, json: () => Promise.resolve(markets) };
       return { ok: true, json: () => Promise.resolve(trades) };
     }));
@@ -515,7 +537,7 @@ describe('WhaleScanner — Auto-promote', () => {
     const allWhales = db.listWhales({ limit: 100 });
     expect(allWhales.total).toBeLessThanOrEqual(2);
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 });
 
@@ -532,7 +554,7 @@ describe('WhaleScanner — FIFO PnL estimation', () => {
       trade({ id: 's2', market: 'market_0', side: 'SELL', size: 50, price: 0.65, timestamp: 1704067380, owner: addr }),
     ];
 
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) return { ok: true, json: () => Promise.resolve(markets) };
       return { ok: true, json: () => Promise.resolve(trades) };
     }));
@@ -547,7 +569,7 @@ describe('WhaleScanner — FIFO PnL estimation', () => {
     expect(match!.estimatedPnlUsd).toBeGreaterThan(0);
     expect(match!.estimatedWinRate).toBeGreaterThan(0);
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 
   it('estimates negative PnL from losing trades', async () => {
@@ -560,7 +582,7 @@ describe('WhaleScanner — FIFO PnL estimation', () => {
       trade({ id: 's1', market: 'market_0', side: 'SELL', size: 100, price: 0.40, timestamp: 1704067260, owner: addr }),
     ];
 
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) return { ok: true, json: () => Promise.resolve(markets) };
       return { ok: true, json: () => Promise.resolve(trades) };
     }));
@@ -573,7 +595,7 @@ describe('WhaleScanner — FIFO PnL estimation', () => {
     expect(match).toBeDefined();
     expect(match!.estimatedPnlUsd).toBeLessThan(0);
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 });
 
@@ -587,7 +609,7 @@ describe('WhaleScanner — getProfile', () => {
       trade({ id: 's1', market: 'market_0', side: 'SELL', size: 100, price: 0.70, timestamp: nowSec, owner: addr }),
     ];
 
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) return { ok: true, json: () => Promise.resolve(markets) };
       return { ok: true, json: () => Promise.resolve(trades) };
     }));
@@ -601,11 +623,11 @@ describe('WhaleScanner — getProfile', () => {
     expect(profile!.address).toBe(addr.toLowerCase());
     expect(profile!.totalVolumeUsd).toBeGreaterThan(0);
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 
   it('returns undefined for unknown address', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+    stubFetch(vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve([]),
     }));
@@ -616,7 +638,7 @@ describe('WhaleScanner — getProfile', () => {
     const profile = scanner.getProfile('0xnonexistent');
     expect(profile).toBeUndefined();
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 
   it('is case-insensitive on address lookup', async () => {
@@ -627,7 +649,7 @@ describe('WhaleScanner — getProfile', () => {
       trade({ id: 'b1', market: 'market_0', side: 'BUY', size: 100, price: 0.50, timestamp: nowSec, owner: addr }),
     ];
 
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) return { ok: true, json: () => Promise.resolve(markets) };
       return { ok: true, json: () => Promise.resolve(trades) };
     }));
@@ -641,7 +663,7 @@ describe('WhaleScanner — getProfile', () => {
     expect(profile).toBeDefined();
     expect(profile!.address).toBe(addr.toLowerCase());
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 });
 
@@ -661,7 +683,7 @@ describe('WhaleScanner — Enriched profile fields', () => {
       trade({ id: 's3', market: 'market_0', side: 'SELL', size: 100, price: 0.50, timestamp: baseTs + 18000, owner: addr }), // loss after 1hr
     ];
 
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) return { ok: true, json: () => Promise.resolve(markets) };
       return { ok: true, json: () => Promise.resolve(trades) };
     }));
@@ -711,7 +733,7 @@ describe('WhaleScanner — Enriched profile fields', () => {
     expect(['active', 'closed']).toContain(mb.positionStatus);
     expect(mb.firstTradeTs).toBeTruthy();
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 });
 
@@ -721,7 +743,7 @@ describe('WhaleScanner — State enrichment', () => {
     const trades0 = clobTrades('0xcond_market_0', 2, 4);
     const trades1 = clobTrades('0xcond_market_1', 2, 4);
 
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    stubFetch(vi.fn().mockImplementation(async (url: string) => {
       if (url.includes('/markets')) return { ok: true, json: () => Promise.resolve(markets) };
       if (url.includes('market=0xcond_market_0')) return { ok: true, json: () => Promise.resolve(trades0) };
       if (url.includes('market=0xcond_market_1')) return { ok: true, json: () => Promise.resolve(trades1) };
@@ -738,6 +760,6 @@ describe('WhaleScanner — State enrichment', () => {
     expect(typeof state.totalScanTimeMs).toBe('number');
     expect(typeof state.marketsInCurrentBatch).toBe('number');
 
-    vi.unstubAllGlobals();
+    restoreFetch();
   });
 });

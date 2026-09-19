@@ -7,6 +7,7 @@ import {
 } from '../../types';
 import { TradeHistory, PricePoint } from '../../data/trade_history';
 import { logger } from '../../reporting/logs';
+import { sizeThrottle } from '../../risk/risk_state';
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    Default configuration – overridden by config.yaml values
@@ -217,6 +218,21 @@ export class FilteredHighProbConvergenceStrategy extends BaseStrategy {
     const slotsAvailable = Math.max(0, this.cfg.max_total_open_positions - currentOpen);
     if (slotsAvailable === 0) return [];
 
+    /* Drawdown throttle, computed once for this pass.
+       ponytail: measured from week-start, not a true peak-to-trough high-water
+       mark — weeklyPnl is the only drawdown state the strategy carries. It
+       understates a drawdown that follows an intra-week peak. Upgrade to
+       peak-tracking if that gap starts mattering. */
+    const ddPct = Math.max(0, -this.weeklyPnl / capital);
+    const throttle = sizeThrottle(ddPct, this.cfg.max_weekly_drawdown_pct);
+    if (throttle === 0) {
+      logger.warn(
+        { strategy: this.name, ddPct: Number(ddPct.toFixed(4)) },
+        'Drawdown limit reached – size throttled to zero, no new entries',
+      );
+      return [];
+    }
+
     const sized: OrderRequest[] = [];
 
     for (const order of cooldownFiltered.slice(0, slotsAvailable)) {
@@ -232,8 +248,11 @@ export class FilteredHighProbConvergenceStrategy extends BaseStrategy {
       /* Compute setup score for this candidate */
       const score = this.computeSetupScore(market);
 
-      /* Base size scaled by score (higher score → bigger position) */
-      const baseUsd = capital * this.cfg.base_risk_pct;
+      /* Base size scaled by score (higher score → bigger position), then
+         throttled by how deep the current drawdown already is. Without the
+         throttle the weekly guard is a cliff — full size until it trips —
+         so the account overshoots the very limit it is meant to respect. */
+      const baseUsd = capital * this.cfg.base_risk_pct * throttle;
       let positionUsd = baseUsd * (1 + score.value);  // score adds 0-100% to base
       positionUsd = Math.min(positionUsd, this.cfg.max_position_usd_per_market);
       positionUsd = Math.max(positionUsd, 1); // minimum $1
@@ -280,6 +299,7 @@ export class FilteredHighProbConvergenceStrategy extends BaseStrategy {
      4. POSITION TRACKING — via engine notifyFill callback
      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
   override notifyFill(order: OrderRequest): void {
+    super.notifyFill(order); // arms cooldown and settles working exits
     if (order.strategy !== this.name) return;
     const market = this.markets.get(order.marketId);
     const score = market ? this.computeSetupScore(market) : { value: 0.5 } as SetupScore;
@@ -327,7 +347,6 @@ export class FilteredHighProbConvergenceStrategy extends BaseStrategy {
   override managePositions(): void {
     this.resetDrawdownCounters();
     const now = Date.now();
-    const toClose: ManagedPosition[] = [];
     const partialSells: { pos: ManagedPosition; sellShares: number; reason: string }[] = [];
 
     for (const pos of this.managedPositions) {
@@ -413,38 +432,53 @@ export class FilteredHighProbConvergenceStrategy extends BaseStrategy {
       }
 
       if (exitReason) {
-        toClose.push(pos);
-        const pnl = (currentMid - pos.entryPrice) * pos.size;
-        this.dailyPnl += pnl;
-        this.weeklyPnl += pnl;
-
-        /* Queue a SELL order so the wallet records the realized PnL */
-        this.pendingExits.push({
-          walletId: this.context?.wallet.walletId ?? 'unknown',
-          marketId: pos.marketId,
-          outcome: pos.outcome,
-          side: 'SELL',
-          price: currentMid,
-          size: pos.size,
-          strategy: this.name,
-        });
-
-        /* Update cluster exposure */
         const clusterId = market.eventId ?? market.seriesSlug ?? pos.marketId;
-        const prev = this.clusterExposure.get(clusterId) ?? 0;
-        this.clusterExposure.set(clusterId, Math.max(0, prev - pos.costBasis));
+        const entryPrice = pos.entryPrice;
 
+        /* Everything below settles on the fill.  Booking PnL, freeing cluster
+           exposure and dropping the position at queue time meant an unfilled
+           exit recorded profit we never took and freed risk budget we were
+           still using. */
+        this.queueExit(
+          {
+            walletId: this.context?.wallet.walletId ?? 'unknown',
+            marketId: pos.marketId,
+            outcome: pos.outcome,
+            side: 'SELL',
+            price: currentMid,
+            size: pos.size,
+            strategy: this.name,
+          },
+          (filled) => {
+            const pnl = (currentMid - entryPrice) * filled;
+            this.dailyPnl += pnl;
+            this.weeklyPnl += pnl;
+
+            const released = entryPrice * filled;
+            const prev = this.clusterExposure.get(clusterId) ?? 0;
+            this.clusterExposure.set(clusterId, Math.max(0, prev - released));
+
+            pos.size -= filled;
+            pos.costBasis = entryPrice * pos.size;
+            if (pos.size <= 0) {
+              const idx = this.managedPositions.indexOf(pos);
+              if (idx >= 0) this.managedPositions.splice(idx, 1);
+            }
+          },
+        );
+
+        const expectedPnl = (currentMid - entryPrice) * pos.size;
         logger.info(
           {
             strategy: this.name,
             marketId: pos.marketId,
             outcome: pos.outcome,
             reason: exitReason,
-            pnl: pnl.toFixed(4),
+            expectedPnl: expectedPnl.toFixed(4),
             hoursHeld: hoursHeld.toFixed(1),
             peakBps: pos.peakBps.toFixed(0),
           },
-          `CONVERGENCE exit: ${pos.outcome} market=${pos.marketId} reason=${exitReason} pnl=$${pnl.toFixed(4)}`,
+          `CONVERGENCE exit QUEUED: ${pos.outcome} market=${pos.marketId} reason=${exitReason} expected=$${expectedPnl.toFixed(4)} (booked on fill)`,
         );
       }
     }
@@ -455,41 +489,39 @@ export class FilteredHighProbConvergenceStrategy extends BaseStrategy {
       if (actualSell < 1) continue;
       const market = this.markets.get(pos.marketId);
       const sellPrice = market?.midPrice ?? pos.entryPrice;
-      const pnl = (sellPrice - pos.entryPrice) * actualSell;
-      pos.size -= actualSell;
-      pos.costBasis = pos.entryPrice * pos.size;
-      this.dailyPnl += pnl;
-      this.weeklyPnl += pnl;
+      const entryPrice = pos.entryPrice;
 
-      /* Queue a partial SELL order through the wallet */
-      this.pendingExits.push({
-        walletId: this.context?.wallet.walletId ?? 'unknown',
-        marketId: pos.marketId,
-        outcome: pos.outcome,
-        side: 'SELL',
-        price: sellPrice,
-        size: actualSell,
-        strategy: this.name,
-      });
+      this.queueExit(
+        {
+          walletId: this.context?.wallet.walletId ?? 'unknown',
+          marketId: pos.marketId,
+          outcome: pos.outcome,
+          side: 'SELL',
+          price: sellPrice,
+          size: actualSell,
+          strategy: this.name,
+        },
+        (filled) => {
+          this.dailyPnl += (sellPrice - entryPrice) * filled;
+          this.weeklyPnl += (sellPrice - entryPrice) * filled;
+          pos.size -= filled;
+          pos.costBasis = entryPrice * pos.size;
+        },
+      );
 
       logger.info(
         {
           strategy: this.name,
           marketId: pos.marketId,
           reason,
-          sharesSold: actualSell,
-          remainingSize: pos.size,
-          pnl: pnl.toFixed(4),
+          sharesOffered: actualSell,
+          currentSize: pos.size,
+          expectedPnl: ((sellPrice - entryPrice) * actualSell).toFixed(4),
         },
-        `CONVERGENCE partial exit: ${reason} sold ${actualSell} shares, ${pos.size} remaining`,
+        `CONVERGENCE partial exit QUEUED: ${reason} offering ${actualSell} shares (size reduces on fill)`,
       );
     }
 
-    /* Remove fully closed positions */
-    for (const closed of toClose) {
-      const idx = this.managedPositions.indexOf(closed);
-      if (idx >= 0) this.managedPositions.splice(idx, 1);
-    }
   }
 
   /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

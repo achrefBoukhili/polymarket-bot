@@ -2,6 +2,19 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { CopyTradeStrategy, DEFAULT_COPY_TRADE_CONFIG, CopyTradeConfig } from '../src/strategies/copy_trading/copy_trade_strategy';
 import { MarketData, WalletState, Signal } from '../src/types';
 
+/* ── Runner-agnostic global stubbing ──
+   vi.stubGlobal is a vitest-only API, so the whole file fails under any
+   other runner. Assigning globalThis.fetch directly works everywhere and
+   stubs exactly the same thing. */
+const REAL_FETCH = globalThis.fetch;
+function stubFetch(impl: unknown): void {
+  (globalThis as { fetch: unknown }).fetch = impl;
+}
+function restoreFetch(): void {
+  (globalThis as { fetch: unknown }).fetch = REAL_FETCH;
+}
+
+
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    Helpers
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
@@ -97,7 +110,7 @@ beforeEach(() => {
     ok: true,
     json: async () => [],
   });
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
 });
 
 afterEach(() => {
@@ -235,8 +248,8 @@ describe('CopyTradeStrategy — Polling', () => {
     const s = createStrategy({ poll_interval_seconds: 0 });
     fetchMock.mockRejectedValue(new Error('Network error'));
 
-    // Should not throw
-    await expect(s.onTimer()).resolves.not.toThrow();
+    // Resolving (rather than rejecting) is the actual claim here.
+    await expect(s.onTimer()).resolves.toBeUndefined();
     const signals = s.generateSignals();
     expect(signals.length).toBe(0);
   });
@@ -639,7 +652,9 @@ describe('CopyTradeStrategy — Risk Management', () => {
         // Price drops → stop loss
         s.onMarketUpdate(mkMarket({ marketId: mktId, outcomePrices: [0.50, 0.50] }));
         s.managePositions();
-        s.drainExitOrders();
+        // The engine reports exits back; the loss is booked on the fill, not
+        // when the exit is queued.
+        for (const exit of s.drainExitOrders()) s.notifyFill(exit);
       }
     }
 

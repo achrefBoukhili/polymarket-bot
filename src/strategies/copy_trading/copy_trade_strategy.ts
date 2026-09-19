@@ -407,6 +407,7 @@ export class CopyTradeStrategy extends BaseStrategy {
   /* ━━━━━━━━━━━━━━ Fill Tracking ━━━━━━━━━━━━━━ */
 
   override notifyFill(order: OrderRequest): void {
+    super.notifyFill(order); // arms cooldown and settles working exits
     if (order.side !== 'BUY') return;
 
     // Find the whale address from the pending data
@@ -482,19 +483,24 @@ export class CopyTradeStrategy extends BaseStrategy {
       }
 
       if (exitReason) {
-        this.pendingExits.push({
-          walletId: this.context?.wallet.walletId ?? 'unknown',
-          marketId,
-          outcome: pos.outcome,
-          side: 'SELL',
-          price: currentPrice,
-          size: pos.size,
-          strategy: this.name,
-        });
-
-        // Track win/loss for the whale
-        this.recordTradeResult(pos.whaleAddress, pnlBps);
-        this.positions.delete(marketId);
+        this.queueExit(
+          {
+            walletId: this.context?.wallet.walletId ?? 'unknown',
+            marketId,
+            outcome: pos.outcome,
+            side: 'SELL',
+            price: currentPrice,
+            size: pos.size,
+            strategy: this.name,
+          },
+          (filled) => {
+            pos.size -= filled;
+            if (pos.size > 0) return;
+            // Only score the whale once the exit actually completed.
+            this.recordTradeResult(pos.whaleAddress, pnlBps);
+            this.positions.delete(marketId);
+          },
+        );
 
         logger.info({
           strategy: this.name,

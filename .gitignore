@@ -44,3 +44,9 @@ sample_convergence_report.json
 
 # Package lock (optional — keep if you want reproducible installs)
 # package-lock.json
+
+# sqlite test databases (WAL mode writes -wal/-shm sidecars)
+tests/.test_*.db*
+
+# recorded market-data tapes (can get large)
+*.jsonl

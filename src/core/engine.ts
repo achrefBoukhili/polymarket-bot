@@ -24,9 +24,14 @@ export class Engine {
     private readonly config: AppConfig,
     private readonly walletManager: WalletManager,
     private readonly orderRouter: OrderRouter,
+    /**
+     * Injected for replay: a ReplayStream driven by a recorded tape exposes
+     * the same events and accessors, so the strategies under test are the
+     * real ones rather than a parallel simulation of them.
+     */
+    stream?: OrderbookStream,
   ) {
-    // Pass Gamma API URL from config to the OrderbookStream
-    this.stream = new OrderbookStream(config.polymarket.gammaApi);
+    this.stream = stream ?? new OrderbookStream(config.polymarket.gammaApi);
   }
 
   async initialize(): Promise<void> {
@@ -34,11 +39,19 @@ export class Engine {
       const StrategyCtor = STRATEGY_REGISTRY[wallet.strategy];
       if (!StrategyCtor) {
         logger.warn({ strategy: wallet.strategy }, 'Unknown strategy; skipping');
-        consoleLog.warn('ENGINE', `Unknown strategy "${wallet.strategy}" — skipping wallet ${wallet.id}`);
+        consoleLog.warn(
+          'ENGINE',
+          `Unknown strategy "${wallet.strategy}" — skipping wallet ${wallet.id}`,
+        );
         continue;
       }
       const walletState = this.walletManager.getWallet(wallet.id)?.getState();
       if (!walletState) {
+        logger.warn({ walletId: wallet.id }, 'Wallet not registered in WalletManager; skipping');
+        consoleLog.warn(
+          'ENGINE',
+          `Wallet "${wallet.id}" not found — skipping. Check ENABLE_LIVE_TRADING setting.`,
+        );
         continue;
       }
       const strategy = new StrategyCtor();
@@ -59,9 +72,8 @@ export class Engine {
       });
     }
 
-    // When a new poll cycle begins, clear each strategy's stale market map.
-    // The per-market 'update' events that follow will repopulate it with only
-    // currently active markets — closed markets are evicted automatically.
+    // A new poll cycle: clear each strategy's stale market map before the
+    // fresh per-market updates repopulate it with only active markets.
     this.stream.on('snapshotBegin', () => {
       for (const runner of this.runners) {
         runner.strategy.onSnapshotBegin();
@@ -70,14 +82,23 @@ export class Engine {
     this.stream.on('update', (data) => this.handleMarketUpdate(data));
   }
 
+  /** One tick, for replay — the scheduler is not running in that mode. */
+  async tickOnce(): Promise<void> {
+    await this.tick();
+  }
+
   start(): void {
     this.stream.start();
     this.scheduler.start(() => this.tick());
     logger.info({ wallets: this.runners.length }, 'Engine started with LIVE Polymarket data');
-    consoleLog.success('ENGINE', `Engine started — ${this.runners.length} strategy runners active`, {
-      runners: this.runners.length,
-      strategies: [...new Set(this.runners.map((r) => r.strategy.name))],
-    });
+    consoleLog.success(
+      'ENGINE',
+      `Engine started — ${this.runners.length} strategy runners active`,
+      {
+        runners: this.runners.length,
+        strategies: [...new Set(this.runners.map((r) => r.strategy.name))],
+      },
+    );
   }
 
   stop(): void {
@@ -168,7 +189,10 @@ export class Engine {
   /** Get all strategy instances that match a given strategy name (for runtime config). */
   getStrategiesByName(strategyName: string): StrategyInterface[] {
     return this.runners
-      .filter((r) => r.config === this.config.strategyConfig[strategyName] || r.strategy.name === strategyName)
+      .filter(
+        (r) =>
+          r.config === this.config.strategyConfig[strategyName] || r.strategy.name === strategyName,
+      )
       .map((r) => r.strategy);
   }
 
@@ -206,6 +230,23 @@ export class Engine {
     return new Set(this.pausedWallets);
   }
 
+  /** Reconcile runs inside the tick, never beside it — see setReconciler(). */
+  private reconciler?: () => Promise<void>;
+  private reconcileIntervalMs = 30_000;
+  private lastReconcileAt = 0;
+
+  /**
+   * Run reconciliation as the first step of a tick rather than on its own
+   * timer.  On a separate timer it can overwrite balances and positions
+   * while a tick sits between its risk check and its order post, and the
+   * order commits against a balance that no longer exists.  Inside the tick,
+   * and with the scheduler's overlap guard, that interleaving cannot happen.
+   */
+  setReconciler(reconciler: () => Promise<void>, intervalMs: number): void {
+    this.reconciler = reconciler;
+    this.reconcileIntervalMs = intervalMs;
+  }
+
   private tickCount = 0;
   private marketUpdateCount = 0;
   private lastScanLog = 0;
@@ -213,14 +254,22 @@ export class Engine {
   private async tick(): Promise<void> {
     this.tickCount++;
 
+    if (this.reconciler && Date.now() - this.lastReconcileAt >= this.reconcileIntervalMs) {
+      this.lastReconcileAt = Date.now();
+      await this.reconciler();
+    }
+
     // Log a periodic scan summary every 12 ticks (~60 s at 5 s interval)
     if (this.tickCount % 12 === 0) {
-      consoleLog.debug('ENGINE', `Tick #${this.tickCount} — ${this.runners.length} runners, ${this.stream.getAllMarkets().length} cached markets, ${this.marketUpdateCount} updates since last summary`);
+      consoleLog.debug(
+        'ENGINE',
+        `Tick #${this.tickCount} — ${this.runners.length} runners, ${this.stream.getAllMarkets().length} cached markets, ${this.marketUpdateCount} updates since last summary`,
+      );
       this.marketUpdateCount = 0;
     }
 
     for (const runner of this.runners) {
-      if (this.pausedWallets.has(runner.walletId)) continue;  // skip paused
+      if (this.pausedWallets.has(runner.walletId)) continue; // skip paused
       runner.strategy.onTimer();
       await this.processSignals(runner);
     }
@@ -232,10 +281,14 @@ export class Engine {
     // Throttle per-market update logs to at most once every 30 s
     const now = Date.now();
     if (now - this.lastScanLog > 30_000) {
-      consoleLog.debug('SCAN', `Market update: ${data.marketId?.slice(0, 12)}… — ${data.outcomes?.length ?? 0} outcomes`, {
-        marketId: data.marketId,
-        question: data.question?.slice(0, 80),
-      });
+      consoleLog.debug(
+        'SCAN',
+        `Market update: ${data.marketId?.slice(0, 12)}… — ${data.outcomes?.length ?? 0} outcomes`,
+        {
+          marketId: data.marketId,
+          question: data.question?.slice(0, 80),
+        },
+      );
       this.lastScanLog = now;
     }
 
@@ -246,50 +299,122 @@ export class Engine {
 
   private async processSignals(runner: StrategyRunner): Promise<void> {
     const signals = await runner.strategy.generateSignals();
+
+    // Log signal count every tick for visibility (debug level when 0, info when > 0)
     if (signals.length > 0) {
-      consoleLog.info('SIGNAL', `[${runner.strategy.name}] Generated ${signals.length} signal(s) for wallet ${runner.walletId}`, {
-        walletId: runner.walletId,
-        strategy: runner.strategy.name,
-        signals: signals.map((s) => ({
-          market: s.marketId.slice(0, 12) + '…',
-          outcome: s.outcome,
-          side: s.side,
-          confidence: Number((s.confidence ?? 0).toFixed(3)),
-          edge: Number((s.edge ?? 0).toFixed(4)),
-        })),
-      });
+      consoleLog.info(
+        'SIGNAL',
+        `[${runner.strategy.name}] Generated ${signals.length} signal(s) for wallet ${runner.walletId}`,
+        {
+          walletId: runner.walletId,
+          strategy: runner.strategy.name,
+          signals: signals.map((s) => ({
+            market: s.marketId.slice(0, 12) + '…',
+            outcome: s.outcome,
+            side: s.side,
+            confidence: Number((s.confidence ?? 0).toFixed(3)),
+            edge: Number((s.edge ?? 0).toFixed(4)),
+          })),
+        },
+      );
+    } else if (this.tickCount % 12 === 0) {
+      // Every ~60s, log market count per strategy so we know they're scanning
+      const marketCount =
+        (runner.strategy as unknown as { markets?: Map<string, unknown> }).markets?.size ?? 0;
+      logger.info(
+        { strategy: runner.strategy.name, walletId: runner.walletId, marketCount, signals: 0 },
+        `[${runner.strategy.name}] 0 signals from ${marketCount} markets (wallet ${runner.walletId})`,
+      );
     }
 
     const orders = await runner.strategy.sizePositions(signals);
     if (orders.length > 0) {
-      consoleLog.info('ORDER', `[${runner.strategy.name}] Sized ${orders.length} order(s) for wallet ${runner.walletId}`, {
-        walletId: runner.walletId,
-        strategy: runner.strategy.name,
-        orders: orders.map((o) => ({
-          market: o.marketId.slice(0, 12) + '…',
-          outcome: o.outcome,
-          side: o.side,
-          price: o.price,
-          size: o.size,
-        })),
-      });
+      consoleLog.info(
+        'ORDER',
+        `[${runner.strategy.name}] Sized ${orders.length} order(s) for wallet ${runner.walletId}`,
+        {
+          walletId: runner.walletId,
+          strategy: runner.strategy.name,
+          orders: orders.map((o) => ({
+            market: o.marketId.slice(0, 12) + '…',
+            outcome: o.outcome,
+            side: o.side,
+            price: o.price,
+            size: o.size,
+          })),
+        },
+      );
+    }
+
+    /* ── Cancel-replace ──
+       A quoting strategy is about to post fresh quotes in these markets, so
+       pull the previous ones first. A resting quote you never cancel is a
+       free option written to the market — it gets picked off on every
+       adverse move. */
+    if (runner.strategy.replacesQuotes && orders.length > 0) {
+      const wallet = this.walletManager.getWallet(runner.walletId);
+      if (wallet?.cancelOrdersForMarket) {
+        for (const marketId of new Set(orders.map((o) => o.marketId))) {
+          try {
+            const n = await wallet.cancelOrdersForMarket(marketId);
+            if (n > 0) {
+              consoleLog.debug(
+                'ORDER',
+                `[${runner.strategy.name}] Cancelled ${n} stale quote(s) in ${marketId.slice(0, 12)}… before re-quoting`,
+                { walletId: runner.walletId, marketId, cancelled: n },
+              );
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            consoleLog.error(
+              'ORDER',
+              `[${runner.strategy.name}] Cancel-replace FAILED for ${marketId} — not posting a new quote on top of the old one: ${msg}`,
+              { walletId: runner.walletId, marketId, error: msg },
+            );
+            return; // better to skip a cycle than to stack duplicate quotes
+          }
+        }
+      }
     }
 
     for (const order of orders) {
       try {
-        const executed = await this.orderRouter.route(order);
-        if (executed) {
-          runner.strategy.notifyFill(order);
-          consoleLog.success('FILL', `[${runner.strategy.name}] Executed ${order.side} ${order.outcome} ×${order.size} @ $${order.price.toFixed(4)}`, {
-            walletId: order.walletId,
-            strategy: order.strategy,
-            marketId: order.marketId,
-            outcome: order.outcome,
-            side: order.side,
-            price: order.price,
-            size: order.size,
-            cost: Number((order.price * order.size).toFixed(4)),
-          });
+        const result = await this.orderRouter.route(order);
+        if (!result) continue; // rejected by risk, or no such wallet
+
+        // Accepted is not filled: a resting GTC order has filled nothing yet.
+        // Telling the strategy otherwise is how its inventory goes fictional.
+        if (result.filledSize > 0) {
+          runner.strategy.notifyFill({ ...order, size: result.filledSize });
+          consoleLog.success(
+            'FILL',
+            `[${runner.strategy.name}] Filled ${order.side} ${order.outcome} ×${result.filledSize} @ $${order.price.toFixed(4)}`,
+            {
+              walletId: order.walletId,
+              strategy: order.strategy,
+              marketId: order.marketId,
+              outcome: order.outcome,
+              side: order.side,
+              price: order.price,
+              size: result.filledSize,
+              restingSize: result.restingSize,
+              cost: Number((order.price * result.filledSize).toFixed(4)),
+            },
+          );
+        } else {
+          // Accepted but unfilled — still a working order, so arm the cooldown
+          // or we re-quote this market on the very next tick.
+          runner.strategy.notifyResting(order);
+          consoleLog.debug(
+            'ORDER',
+            `[${runner.strategy.name}] Resting ${order.side} ${order.outcome} ×${result.restingSize} @ $${order.price.toFixed(4)} — no fill yet`,
+            {
+              walletId: order.walletId,
+              marketId: order.marketId,
+              orderId: result.orderId,
+              restingSize: result.restingSize,
+            },
+          );
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -306,32 +431,60 @@ export class Engine {
     /* ── Route exit orders produced by managePositions() ── */
     const exitOrders = runner.strategy.drainExitOrders();
     if (exitOrders.length > 0) {
-      consoleLog.info('ORDER', `[${runner.strategy.name}] ${exitOrders.length} exit order(s) for wallet ${runner.walletId}`, {
-        walletId: runner.walletId,
-        strategy: runner.strategy.name,
-        exits: exitOrders.map((o) => ({
-          market: o.marketId.slice(0, 12) + '…',
-          outcome: o.outcome,
-          side: o.side,
-          price: o.price,
-          size: o.size,
-        })),
-      });
+      consoleLog.info(
+        'ORDER',
+        `[${runner.strategy.name}] ${exitOrders.length} exit order(s) for wallet ${runner.walletId}`,
+        {
+          walletId: runner.walletId,
+          strategy: runner.strategy.name,
+          exits: exitOrders.map((o) => ({
+            market: o.marketId.slice(0, 12) + '…',
+            outcome: o.outcome,
+            side: o.side,
+            price: o.price,
+            size: o.size,
+          })),
+        },
+      );
     }
 
     for (const exitOrder of exitOrders) {
       try {
-        const executed = await this.orderRouter.route(exitOrder);
-        if (executed) {
-          consoleLog.success('FILL', `[${runner.strategy.name}] Exited ${exitOrder.outcome} ×${exitOrder.size} @ $${exitOrder.price.toFixed(4)}`, {
-            walletId: exitOrder.walletId,
-            strategy: exitOrder.strategy,
-            marketId: exitOrder.marketId,
-            outcome: exitOrder.outcome,
-            side: exitOrder.side,
-            price: exitOrder.price,
-            size: exitOrder.size,
-          });
+        const result = await this.orderRouter.route(exitOrder);
+
+        // Strategies release positions via queueExit()'s callback, which runs
+        // on fill only — so an unfilled exit correctly leaves the position
+        // open, and the strategy retries it after exitRetryMs.
+        if (result && result.filledSize === 0) {
+          runner.strategy.notifyResting(exitOrder);
+          consoleLog.debug(
+            'ORDER',
+            `[${runner.strategy.name}] Exit resting ×${result.restingSize} @ $${exitOrder.price.toFixed(4)} — position stays open until it fills`,
+            {
+              walletId: exitOrder.walletId,
+              marketId: exitOrder.marketId,
+              orderId: result.orderId,
+              restingSize: result.restingSize,
+            },
+          );
+        }
+
+        if (result && result.filledSize > 0) {
+          // Settles the working exit, which is what releases the position.
+          runner.strategy.notifyFill({ ...exitOrder, size: result.filledSize });
+          consoleLog.success(
+            'FILL',
+            `[${runner.strategy.name}] Exited ${exitOrder.outcome} ×${result.filledSize} @ $${exitOrder.price.toFixed(4)}`,
+            {
+              walletId: exitOrder.walletId,
+              strategy: exitOrder.strategy,
+              marketId: exitOrder.marketId,
+              outcome: exitOrder.outcome,
+              side: exitOrder.side,
+              price: exitOrder.price,
+              size: exitOrder.size,
+            },
+          );
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

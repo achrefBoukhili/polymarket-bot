@@ -26,6 +26,7 @@ interface PriceSnapshot {
 
 export class SpreadStrategy extends BaseStrategy {
   readonly name = 'market_making';
+  readonly replacesQuotes = true;
 
   /* ── Inventory per market ── */
   private inventory = new Map<string, Inventory>();
@@ -162,7 +163,7 @@ export class SpreadStrategy extends BaseStrategy {
       /* Size: smaller when inventory is building up */
       const inventoryPenalty = Math.max(0.3, 1 - Math.abs(netInventory) / this.maxInventoryPerMarket);
       const baseSize = Math.max(1, Math.floor(capital * 0.01 / price));
-      const adjustedSize = Math.max(1, Math.floor(baseSize * inventoryPenalty));
+      const adjustedSize = Math.max(5, Math.floor(baseSize * inventoryPenalty));
 
       return { ...order, price, size: adjustedSize };
     });
@@ -170,6 +171,7 @@ export class SpreadStrategy extends BaseStrategy {
 
   /** Track inventory on fill via engine callback */
   override notifyFill(order: OrderRequest): void {
+    super.notifyFill(order); // arms cooldown and settles working exits
     if (order.strategy !== this.name) return;
     const inv = this.inventory.get(order.marketId) ?? { yesShares: 0, noShares: 0, totalCost: 0 };
     if (order.side === 'BUY' && order.outcome === 'YES') {
@@ -248,19 +250,26 @@ export class SpreadStrategy extends BaseStrategy {
           `MM: exiting inventory — ${exitReason}`,
         );
 
-        this.pendingExits.push({
-          walletId,
-          marketId,
-          outcome: 'YES',
-          side: 'SELL',
-          price: Number(Math.max(0.02, currentAsk - 0.002).toFixed(4)), // hit the bid aggressively
-          size: exitSize,
-          strategy: this.name,
-        });
-
-        // Update local inventory tracking immediately
-        inv.yesShares -= exitSize;
-        inv.totalCost -= (inv.totalCost / Math.max(netYes, 1)) * exitSize;
+        /* Inventory comes off on fill.  Decrementing at queue time made the
+           book think it was flat while the shares were still held — and then
+           re-quoted against inventory it no longer believed in. */
+        const avgCost = inv.totalCost / Math.max(netYes, 1);
+        this.queueExit(
+          {
+            walletId,
+            marketId,
+            outcome: 'YES',
+            side: 'SELL',
+            price: Number(Math.max(0.02, currentAsk - 0.002).toFixed(4)), // hit the bid aggressively
+            size: exitSize,
+            strategy: this.name,
+          },
+          (filled) => {
+            inv.yesShares = Math.max(0, inv.yesShares - filled);
+            inv.totalCost = Math.max(0, inv.totalCost - avgCost * filled);
+            this.inventory.set(marketId, inv);
+          },
+        );
       }
     }
   }

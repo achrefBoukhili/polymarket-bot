@@ -17,13 +17,29 @@ describe('WalletManager', () => {
     expect(wallets[0].mode).toBe('PAPER');
   });
 
-  it('skips live wallets when not enabled', () => {
+  it('downgrades a LIVE wallet to PAPER when live trading is disabled', () => {
     const manager = new WalletManager();
     manager.registerWallet(
       { ...walletConfig, id: 'live_1', mode: 'LIVE' },
       walletConfig.strategy,
       false,
     );
-    expect(manager.listWallets()).toHaveLength(0);
+
+    // The wallet still runs — it just cannot touch real money. Refusing it
+    // outright would leave the bot with nothing to do; the property that
+    // actually matters is that it is never silently LIVE.
+    const wallets = manager.listWallets();
+    expect(wallets).toHaveLength(1);
+    expect(wallets[0].mode).toBe('PAPER');
+  });
+
+  it('honours LIVE only when live trading is explicitly enabled', () => {
+    const manager = new WalletManager();
+    manager.registerWallet(
+      { ...walletConfig, id: 'live_2', mode: 'LIVE' },
+      walletConfig.strategy,
+      true,
+    );
+    expect(manager.listWallets()[0].mode).toBe('LIVE');
   });
 });

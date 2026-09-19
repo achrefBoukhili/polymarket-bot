@@ -5,16 +5,24 @@ import { WhaleDB } from '../src/whales/whale_db';
 
 const TEST_DB_PATH = path.join(__dirname, '.test_whale.db');
 
+/** WAL mode writes -wal and -shm beside the database; all three must go. */
+function removeDb(): void {
+  for (const suffix of ['', '-wal', '-shm']) {
+    const f = TEST_DB_PATH + suffix;
+    if (fs.existsSync(f)) fs.unlinkSync(f);
+  }
+}
+
 let db: WhaleDB;
 
 beforeEach(() => {
-  if (fs.existsSync(TEST_DB_PATH)) fs.unlinkSync(TEST_DB_PATH);
+  removeDb();
   db = new WhaleDB(TEST_DB_PATH);
 });
 
 afterEach(() => {
   db.close();
-  if (fs.existsSync(TEST_DB_PATH)) fs.unlinkSync(TEST_DB_PATH);
+  removeDb();
 });
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

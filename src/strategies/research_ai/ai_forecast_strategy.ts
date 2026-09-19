@@ -418,6 +418,7 @@ export class AiForecastStrategy extends BaseStrategy {
 
   /* ── Position tracking via engine callback ──────────────────── */
   override notifyFill(order: OrderRequest): void {
+    super.notifyFill(order); // arms cooldown and settles working exits
     if (order.strategy !== this.name) return;
     const prices = this.priceHistory.get(order.marketId) ?? [];
     const regime = this.detectRegime(prices);
@@ -444,7 +445,6 @@ export class AiForecastStrategy extends BaseStrategy {
 
   /* ── Manage positions ───────────────────────────────────────── */
   override managePositions(): void {
-    const toRemove: number[] = [];
 
     for (let i = 0; i < this.positions.length; i++) {
       const pos = this.positions[i];
@@ -467,19 +467,23 @@ export class AiForecastStrategy extends BaseStrategy {
       // ── Partial profit: take 50% at +100 bps ──────────────
       if (!pos.partialTaken && edgeBps >= 100) {
         const partialSize = Math.floor(pos.originalSize * 0.5);
-        pos.size = pos.size - partialSize;
-        pos.partialTaken = true;
-
-        /* Queue partial SELL through the wallet */
-        this.pendingExits.push({
-          walletId: this.context?.wallet.walletId ?? 'unknown',
-          marketId: pos.marketId,
-          outcome: pos.outcome,
-          side: pos.side === 'BUY' ? 'SELL' : 'BUY',
-          price: currentPrice,
-          size: partialSize,
-          strategy: this.name,
-        });
+        /* partialTaken flips on fill, not on queue — otherwise an unfilled
+           partial permanently disables the profit-take. */
+        this.queueExit(
+          {
+            walletId: this.context?.wallet.walletId ?? 'unknown',
+            marketId: pos.marketId,
+            outcome: pos.outcome,
+            side: pos.side === 'BUY' ? 'SELL' : 'BUY',
+            price: currentPrice,
+            size: partialSize,
+            strategy: this.name,
+          },
+          (filled) => {
+            pos.size -= filled;
+            pos.partialTaken = true;
+          },
+        );
         continue;
       }
 
@@ -509,23 +513,30 @@ export class AiForecastStrategy extends BaseStrategy {
       }
 
       if (exitReason) {
-        toRemove.push(i);
         const exitSide: 'BUY' | 'SELL' = pos.side === 'BUY' ? 'SELL' : 'BUY';
-        this.pendingExits.push({
-          walletId: this.context?.wallet.walletId ?? 'unknown',
-          marketId: pos.marketId,
-          outcome: pos.outcome,
-          side: exitSide,
-          price: currentPrice,
-          size: pos.size,
-          strategy: this.name,
-        });
+        /* Release the position on fill, not on queue: an exit that
+           rests unfilled must leave us still holding it. */
+        this.queueExit(
+          {
+            walletId: this.context?.wallet.walletId ?? 'unknown',
+            marketId: pos.marketId,
+            outcome: pos.outcome,
+            side: exitSide,
+            price: currentPrice,
+            size: pos.size,
+            strategy: this.name,
+          },
+          (filled) => {
+            pos.size -= filled;
+            if (pos.size <= 0) {
+              const at = this.positions.indexOf(pos);
+              if (at !== -1) this.positions.splice(at, 1);
+            }
+          },
+        );
       }
     }
 
-    for (let i = toRemove.length - 1; i >= 0; i--) {
-      this.positions.splice(toRemove[i], 1);
-    }
   }
 
   /* ── Helpers ────────────────────────────────────────────────── */

@@ -4,7 +4,7 @@
    Schema is Postgres-ready (standard SQL types, no SQLite-only features).
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
-import { Database, Statement } from 'bun:sqlite';
+import { Database, Statement, type SQLQueryBindings } from 'bun:sqlite';
 import path from 'path';
 import fs from 'fs';
 import { logger } from '../reporting/logs';
@@ -443,7 +443,7 @@ export class WhaleDB {
     orderBy?: string;
   }): { whales: Whale[]; total: number } {
     let where = 'WHERE 1=1';
-    const params: unknown[] = [];
+    const params: SQLQueryBindings[] = [];
     if (opts?.starred !== undefined) {
       where += ' AND starred = ?';
       params.push(opts.starred ? 1 : 0);
@@ -495,7 +495,7 @@ export class WhaleDB {
     >,
   ): void {
     const sets: string[] = ["updated_at = datetime('now')"];
-    const params: unknown[] = [];
+    const params: SQLQueryBindings[] = [];
     if (updates.displayName !== undefined) {
       sets.push('display_name = ?');
       params.push(updates.displayName);
@@ -614,7 +614,7 @@ export class WhaleDB {
     opts?: { limit?: number; cursor?: string; marketId?: string },
   ): WhaleTrade[] {
     let where = 'WHERE whale_id = ?';
-    const params: unknown[] = [whaleId];
+    const params: SQLQueryBindings[] = [whaleId];
     if (opts?.cursor) {
       where += ' AND ts < ?';
       params.push(opts.cursor);
@@ -788,7 +788,7 @@ export class WhaleDB {
     opts?: { fromDate?: string; toDate?: string },
   ): WhaleMetricsDaily[] {
     let where = 'WHERE whale_id = ?';
-    const params: unknown[] = [whaleId];
+    const params: SQLQueryBindings[] = [whaleId];
     if (opts?.fromDate) {
       where += ' AND date >= ?';
       params.push(opts.fromDate);
@@ -917,7 +917,7 @@ export class WhaleDB {
     excludeMuted?: boolean;
   }): WhaleCandidate[] {
     let where = 'WHERE 1=1';
-    const params: unknown[] = [];
+    const params: SQLQueryBindings[] = [];
     if (opts?.excludeApproved) {
       where += ' AND approved = 0';
     }
@@ -968,7 +968,7 @@ export class WhaleDB {
     cursor?: string;
   }): Alert[] {
     let where = 'WHERE 1=1';
-    const params: unknown[] = [];
+    const params: SQLQueryBindings[] = [];
     if (opts?.whaleId) {
       where += ' AND whale_id = ?';
       params.push(opts.whaleId);
@@ -1023,7 +1023,7 @@ export class WhaleDB {
 
   listSignals(opts?: { limit?: number; cursor?: string }): WhaleSignal[] {
     let where = 'WHERE 1=1';
-    const params: unknown[] = [];
+    const params: SQLQueryBindings[] = [];
     if (opts?.cursor) {
       where += ' AND cursor_key > ?';
       params.push(opts.cursor);
@@ -1204,7 +1204,7 @@ export class WhaleDB {
   /** Sum realized PnL from settlement ledger */
   getSettledPnl(whaleId: number, sinceDate?: string): number {
     const where = sinceDate ? 'WHERE whale_id = ? AND close_ts >= ?' : 'WHERE whale_id = ?';
-    const params: unknown[] = sinceDate ? [whaleId, sinceDate] : [whaleId];
+    const params: SQLQueryBindings[] = sinceDate ? [whaleId, sinceDate] : [whaleId];
     const row = this.db
       .query(`SELECT COALESCE(SUM(realized_pnl),0) as pnl FROM whale_settlement_ledger ${where}`)
       .get(...params) as { pnl: number };

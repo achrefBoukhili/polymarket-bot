@@ -101,6 +101,7 @@ export class MomentumStrategy extends BaseStrategy {
 
   /* ── Position tracking via engine callback ── */
   override notifyFill(order: OrderRequest): void {
+    super.notifyFill(order); // arms cooldown and settles working exits
     if (order.side !== 'BUY') return;
     this.managedPositions.set(order.marketId, {
       marketId: order.marketId,
@@ -370,17 +371,21 @@ export class MomentumStrategy extends BaseStrategy {
       }
 
       if (exitReason) {
-        this.pendingExits.push({
-          walletId: this.context?.wallet.walletId ?? 'unknown',
-          marketId,
-          outcome: pos.outcome,
-          side: 'SELL',
-          price: currentPrice,
-          size: pos.size,
-          strategy: this.name,
-        });
-
-        this.managedPositions.delete(marketId);
+        this.queueExit(
+          {
+            walletId: this.context?.wallet.walletId ?? 'unknown',
+            marketId,
+            outcome: pos.outcome,
+            side: 'SELL',
+            price: currentPrice,
+            size: pos.size,
+            strategy: this.name,
+          },
+          (filled) => {
+            pos.size -= filled;
+            if (pos.size <= 0) this.managedPositions.delete(marketId);
+          },
+        );
 
         logger.info(
           { strategy: this.name, marketId, outcome: pos.outcome, reason: exitReason, pnlBps: pnlBps.toFixed(0) },

@@ -47,6 +47,8 @@ export interface OrderRequest {
   price: number;
   size: number;
   strategy: string;
+  /** CLOB token ID — required for LIVE orders, resolved from MarketData.clobTokenIds */
+  tokenId?: string;
 }
 
 export interface OrderFill {
@@ -73,6 +75,14 @@ export interface MarketData {
   volume24h: number;
   liquidity: number;
   timestamp: number;
+  /** Neg-risk market: linked outcomes settle as a group, different order mechanics. */
+  negRisk?: boolean;
+  /** This market's own fee schedule, served by Gamma. */
+  feeSchedule?: import('./execution/fees').FeeSchedule;
+  /** Venue minimum order size for this market, in shares. */
+  orderMinSize?: number;
+  /** Venue price tick for this market (0.01, 0.001, …). */
+  orderPriceMinTickSize?: number;
   /** ISO-8601 end / resolution date from Gamma (may be absent) */
   endDate?: string;
   /** Gamma event ID – used for correlation / cluster grouping */
@@ -85,10 +95,6 @@ export interface MarketData {
   oneDayPriceChange?: number;
   /** 1-week price change reported by Gamma */
   oneWeekPriceChange?: number;
-  /** Negative risk indicator */
-  negRisk?: boolean;
-  orderPriceMinTickSize?: number;
-  orderMinSize?: number;
 }
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -155,6 +161,20 @@ export interface WalletState {
   openPositions: Position[];
   realizedPnl: number;
   riskLimits: RiskLimits;
+}
+
+/**
+ * What actually happened to an order at submission time.
+ *
+ * A GTC limit order that is accepted is NOT filled — it rests on the book.
+ * Callers must branch on filledSize, never on "the post succeeded".
+ */
+export interface FillResult {
+  orderId: string;
+  /** Shares matched immediately. 0 means nothing filled. */
+  filledSize: number;
+  /** Shares left resting on the book. */
+  restingSize: number;
 }
 
 export interface TradeRecord {

@@ -1253,6 +1253,10 @@ export class WhaleScanner {
       const allHoldTimesMs: number[] = [];
       const allPerTradePnls: number[] = [];
       const marketBreakdown: ScannedMarketEntry[] = [];
+      /* The loop below already builds a full MarketAgg per market (with the
+         buy/sell split). Keeping them lets inferTags() do its job instead of
+         the four-line stand-in that used to shadow it. */
+      const marketAggs = new Map<string, MarketAgg>();
 
       for (const m of markets) {
         const mktId = m.marketId;
@@ -1285,6 +1289,8 @@ export class WhaleScanner {
             })),
           currentPrices,
         };
+
+        marketAggs.set(mktId, mAgg);
 
         const pnlResult = this.estimateMarketPnl(mAgg);
         totalEstPnl += pnlResult.pnl;
@@ -1379,16 +1385,39 @@ export class WhaleScanner {
       );
       const pnlScore = Math.min(100, (Math.log10(Math.max(combinedPnl, 1)) / 5) * 100);
       const winScore = estimatedWinRate * 100;
-      const riskPen = Math.max(0, maxDrawdownPct * 200);
+      /* Every other term is a 0-100 sub-score, but the drawdown penalty was
+         unbounded: a 500% drawdown gave riskPen 1000, making that term -180
+         and dragging the whole composite to -341. Clamp the penalty into the
+         same 0-100 range as its siblings, then clamp the result. */
+      const riskPen = Math.min(100, Math.max(0, maxDrawdownPct * 200));
 
-      const compositeScore = Math.round(
-        (volScore * 0.15 + pnlScore * 0.25 + winScore * 0.3 + (100 - riskPen) * 0.2 + (confidenceScore * 100) * 0.1)
+      const compositeScore = Math.max(
+        0,
+        Math.min(
+          100,
+          Math.round(
+            volScore * 0.15 +
+              pnlScore * 0.25 +
+              winScore * 0.3 +
+              (100 - riskPen) * 0.2 +
+              confidenceScore * 100 * 0.1,
+          ),
+        ),
       );
 
-      const suggestedTags: string[] = [];
-      if (estimatedRoi > 0.1) suggestedTags.push('high_roi');
-      if (estimatedWinRate > 0.7) suggestedTags.push('high_winrate');
-      if (agg.volumeUsd > 100_000) suggestedTags.push('whale');
+      const suggestedTags = this.inferTags(
+        {
+          trades: agg.trades,
+          volumeUsd: agg.volumeUsd,
+          maxSingleTradeUsd: agg.maxSingleTradeUsd,
+          firstTradeTs: agg.firstTradeTs,
+          lastTradeTs: agg.lastTradeTs,
+          markets: marketAggs,
+        },
+        estimatedWinRate,
+        estimatedRoi,
+        avgHoldMs,
+      );
       if (tradingSpanDays > 30) suggestedTags.push('veteran');
 
       profiles.push({

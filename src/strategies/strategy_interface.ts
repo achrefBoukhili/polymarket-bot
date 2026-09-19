@@ -8,14 +8,21 @@ export interface StrategyContext {
 export interface StrategyInterface {
   readonly name: string;
   initialize(context: StrategyContext): Promise<void> | void;
-  /** Called once at the start of each new poll cycle before any onMarketUpdate calls. */
+  /** Called once per poll snapshot, before that cycle's onMarketUpdate calls. */
   onSnapshotBegin(): void;
+  /**
+   * True for strategies that re-quote the same markets every cycle. The
+   * engine pulls their previous resting orders before posting new ones;
+   * without that, stale quotes stack up as free options.
+   */
+  readonly replacesQuotes?: boolean;
   onMarketUpdate(data: MarketData): Promise<void> | void;
   onTimer(): Promise<void> | void;
   generateSignals(): Promise<Signal[]> | Signal[];
   sizePositions(signals: Signal[]): Promise<OrderRequest[]> | OrderRequest[];
   submitOrders(orders: OrderRequest[]): Promise<void> | void;
   notifyFill(order: OrderRequest): void;
+  notifyResting(order: OrderRequest): void;
   managePositions(): Promise<void> | void;
   drainExitOrders(): OrderRequest[];
   shutdown(): Promise<void> | void;
@@ -59,13 +66,6 @@ export abstract class BaseStrategy implements StrategyInterface {
 
   onMarketUpdate(data: MarketData): void {
     this.markets.set(data.marketId, data);
-    // Hard cap on how many markets the strategy will track at once
-    // private static readonly MAX_MARKETS = 500;
-    // Evict oldest entry when we exceed the cap (Map iterates insertion order)
-    // if (this.markets.size > BaseStrategy.MAX_MARKETS) {
-    //   const oldest = this.markets.keys().next().value as string;
-    //   this.markets.delete(oldest);
-    // }
   }
 
   onTimer(): void {
@@ -94,9 +94,7 @@ export abstract class BaseStrategy implements StrategyInterface {
     });
 
     return filtered.map((signal) => {
-      // Record cooldown
       const key = `${signal.marketId}:${signal.outcome}:${signal.side}`;
-      this.tradeCooldowns.set(key, now);
 
       // Use actual market price when available, fall back to 0.5 + edge
       const market = this.markets.get(signal.marketId);
@@ -110,6 +108,9 @@ export abstract class BaseStrategy implements StrategyInterface {
         price = Number((0.5 + signal.edge).toFixed(4));
       }
 
+      // Resolve CLOB token ID for the outcome (index 0 = YES, index 1 = NO)
+      const tokenId = market ? market.clobTokenIds[signal.outcome === 'YES' ? 0 : 1] : undefined;
+
       return {
         walletId,
         marketId: signal.marketId,
@@ -118,6 +119,7 @@ export abstract class BaseStrategy implements StrategyInterface {
         price: Number(Math.max(0.01, Math.min(0.99, price)).toFixed(4)),
         size: Math.max(1, Math.floor(10 * signal.confidence)),
         strategy: this.name,
+        tokenId,
       };
     });
   }
@@ -130,8 +132,90 @@ export abstract class BaseStrategy implements StrategyInterface {
    * Called by the engine after a successful fill.
    * Override in subclasses to track positions.
    */
-  notifyFill(_order: OrderRequest): void {
-    return;
+  notifyFill(order: OrderRequest): void {
+    // Record cooldown only after a successful fill, not at sizing time
+    this.armCooldown(order);
+    // Release any position this fill was exiting.
+    this.settleExit(order);
+  }
+
+  /**
+   * Called by the engine when an order was accepted but is resting unfilled.
+   *
+   * The cooldown has to arm here too.  A working order is a reason not to
+   * quote the same market again — without this the engine re-quotes every
+   * tick while the first order sits on the book, stacking duplicates.
+   */
+  notifyResting(order: OrderRequest): void {
+    this.armCooldown(order);
+  }
+
+  private armCooldown(order: OrderRequest): void {
+    this.tradeCooldowns.set(this.orderKey(order), Date.now());
+  }
+
+  private orderKey(order: { marketId: string; outcome: string; side: string }): string {
+    return `${order.marketId}:${order.outcome}:${order.side}`;
+  }
+
+  /* ━━━━━━━━━━━━━━ Exit lifecycle ━━━━━━━━━━━━━━
+
+     An exit order is a request, not an outcome.  Releasing the position at
+     queue time — which every strategy used to do — means an exit that rests
+     unfilled leaves the strategy believing it is flat while the position is
+     still open.  Positions are released here, on fill, and only for the
+     quantity that actually filled.                                        */
+
+  /** Exits handed to the engine and not yet fully filled. */
+  private pendingExitState = new Map<
+    string,
+    { remaining: number; queuedAt: number; onFilled: (filledSize: number) => void }
+  >();
+
+  /** How long to wait before re-queueing an exit that never filled. */
+  protected exitRetryMs = 60_000;
+
+  /**
+   * Queue an exit and say what to do when (and only when) it fills.
+   *
+   * Returns false if an exit for this market/outcome/side is already working,
+   * which is what stops managePositions() from re-queueing the same exit on
+   * every tick now that the position survives until the fill lands.
+   */
+  protected queueExit(order: OrderRequest, onFilled: (filledSize: number) => void): boolean {
+    const key = this.orderKey(order);
+    const existing = this.pendingExitState.get(key);
+
+    if (existing) {
+      if (Date.now() - existing.queuedAt < this.exitRetryMs) return false;
+      // Stale: it never filled, so its callback never ran and the position
+      // was never released. Drop it and let this fresh attempt through.
+      this.pendingExitState.delete(key);
+    }
+
+    this.pendingExits.push(order);
+    this.pendingExitState.set(key, { remaining: order.size, queuedAt: Date.now(), onFilled });
+    return true;
+  }
+
+  /** Apply a fill against a working exit, if this fill is one. */
+  private settleExit(order: OrderRequest): void {
+    const key = this.orderKey(order);
+    const pending = this.pendingExitState.get(key);
+    if (!pending) return;
+
+    const filled = Math.min(order.size, pending.remaining);
+    if (filled <= 0) return;
+
+    pending.remaining -= filled;
+    if (pending.remaining <= 0) this.pendingExitState.delete(key);
+
+    pending.onFilled(filled);
+  }
+
+  /** Exits currently working, for diagnostics. */
+  protected hasWorkingExit(order: { marketId: string; outcome: string; side: string }): boolean {
+    return this.pendingExitState.has(this.orderKey(order));
   }
 
   managePositions(): void {

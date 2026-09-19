@@ -194,6 +194,7 @@ export class MispricingArbitrageStrategy extends BaseStrategy {
 
   /* ── Position tracking via engine callback ──────────────────── */
   override notifyFill(order: OrderRequest): void {
+    super.notifyFill(order); // arms cooldown and settles working exits
     if (order.strategy !== this.name) return;
     this.positions.push({
       marketId: order.marketId,
@@ -214,7 +215,6 @@ export class MispricingArbitrageStrategy extends BaseStrategy {
 
   /* ── Manage positions ───────────────────────────────────────── */
   override managePositions(): void {
-    const toRemove: number[] = [];
 
     for (let i = 0; i < this.positions.length; i++) {
       const pos = this.positions[i];
@@ -254,24 +254,31 @@ export class MispricingArbitrageStrategy extends BaseStrategy {
       }
 
       if (exitReason) {
-        toRemove.push(i);
 
         const exitSide: 'BUY' | 'SELL' = pos.side === 'BUY' ? 'SELL' : 'BUY';
-        this.pendingExits.push({
-          walletId: this.context?.wallet.walletId ?? 'unknown',
-          marketId: pos.marketId,
-          outcome: pos.outcome,
-          side: exitSide,
-          price: currentPrice,
-          size: pos.size,
-          strategy: this.name,
-        });
+        /* Release the position on fill, not on queue: an exit that
+           rests unfilled must leave us still holding it. */
+        this.queueExit(
+          {
+            walletId: this.context?.wallet.walletId ?? 'unknown',
+            marketId: pos.marketId,
+            outcome: pos.outcome,
+            side: exitSide,
+            price: currentPrice,
+            size: pos.size,
+            strategy: this.name,
+          },
+          (filled) => {
+            pos.size -= filled;
+            if (pos.size <= 0) {
+              const at = this.positions.indexOf(pos);
+              if (at !== -1) this.positions.splice(at, 1);
+            }
+          },
+        );
       }
     }
 
-    for (let i = toRemove.length - 1; i >= 0; i--) {
-      this.positions.splice(toRemove[i], 1);
-    }
   }
 
   /* ── Multi-factor mispricing score ──────────────────────────── */

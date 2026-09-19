@@ -1,4 +1,6 @@
 import { EventEmitter } from 'events';
+import fs from 'fs';
+import path from 'path';
 import { MarketData } from '../types';
 import { MarketFetcher } from './market_fetcher';
 import { logger } from '../reporting/logs';
@@ -9,24 +11,29 @@ import { consoleLog } from '../reporting/console_log';
  * real MarketData updates for every tracked market.
  */
 export class OrderbookStream extends EventEmitter {
+  private static readonly MAX_CACHE_SIZE = 5_000;
+  private static readonly MAX_SEEN_MARKETS = 50_000;
   private timer?: NodeJS.Timeout;
   private readonly fetcher: MarketFetcher;
   private readonly pollMs: number;
-  /**
-   * Current snapshot of live markets keyed by marketId.
-   * Rebuilt from scratch on every poll — size always equals the number of
-   * currently active markets, so closed markets are evicted automatically.
-   */
-  private cache = new Map<string, MarketData>();
+  /** Cache of latest data keyed by marketId so strategies see history */
+  private readonly cache = new Map<string, MarketData>();
+  /** Persistent cache of markets seen across restarts */
+  private readonly seenMarkets = new Map<string, { firstSeenAt: string; lastSeenAt: string }>();
+  private readonly seenCachePath: string;
   private pollCount = 0;
   private isPolling = false;
 
-  constructor(gammaApi?: string, pollMs = 15_000) {
+  constructor(
+    gammaApi?: string,
+    pollMs = 15_000,
+    seenCachePath = path.join(process.cwd(), '.cache', 'market_seen.json'),
+  ) {
     super();
-    // No limit — fetches all active markets every poll; memory stays flat
-    // because the cache is replaced, not accumulated, on each cycle.
     this.fetcher = new MarketFetcher(gammaApi);
     this.pollMs = pollMs;
+    this.seenCachePath = seenCachePath;
+    this.loadSeenCache();
   }
 
   /** Start polling. First poll fires immediately. */
@@ -59,32 +66,55 @@ export class OrderbookStream extends EventEmitter {
     return [...this.cache.values()];
   }
 
+  /** Return a snapshot of persistent seen markets (for dashboards/diagnostics). */
+  getSeenMarkets(): Array<{ marketId: string; firstSeenAt: string; lastSeenAt: string }> {
+    return [...this.seenMarkets.entries()].map(([marketId, entry]) => ({
+      marketId,
+      firstSeenAt: entry.firstSeenAt,
+      lastSeenAt: entry.lastSeenAt,
+    }));
+  }
+
+  /** Look up markets by id including closed ones — used for settlement. */
+  async fetchMarketsByIds(ids: string[]) {
+    return this.fetcher.fetchMarketsByIds(ids);
+  }
+
   private async poll(): Promise<void> {
-    if (this.isPolling) return; // Prevent overlapping API requests and infinite memory loops
+    // A slow fetch must not stack polls on top of each other.
+    if (this.isPolling) return;
     this.isPolling = true;
 
     try {
       const markets = await this.fetcher.fetchSnapshot();
+      const newlyDiscovered = this.updateSeenCache(markets);
+      const prevSize = this.cache.size;
 
-      // ── Snapshot-swap: replace the cache wholesale rather than accumulating.
-      // Any market that is no longer returned by the API (closed, inactive)
-      // simply disappears from the cache — no TTL bookkeeping needed.
-      // Emit 'snapshotBegin' first so listeners (strategies) can clear their
-      // own stale state before receiving the fresh per-market update events.
+      /* ── Snapshot swap ──
+         Replace the cache wholesale instead of accumulating.  A market the
+         API no longer returns (closed, resolved, delisted) simply vanishes,
+         with no TTL bookkeeping.  'snapshotBegin' fires first so strategies
+         can drop their own stale markets before the fresh updates arrive —
+         without it they quote prices for markets that no longer exist. */
       this.emit('snapshotBegin', markets.length);
       this.cache.clear();
       for (const m of markets) {
         this.cache.set(m.marketId, m);
         this.emit('update', m);
       }
+      this.evictStaleEntries();
+      this.persistSeenCache();
       this.pollCount++;
+      const newMarkets = this.cache.size - prevSize;
       consoleLog.info(
         'SCAN',
-        `Poll #${this.pollCount} complete — ${markets.length} markets fetched & cached`,
+        `Poll #${this.pollCount} complete — ${markets.length} markets fetched, ${this.cache.size} cached${newMarkets > 0 ? `, ${newMarkets} new cached` : ''}${newlyDiscovered > 0 ? `, ${newlyDiscovered} newly discovered` : ''}`,
         {
           pollNumber: this.pollCount,
           fetched: markets.length,
           cached: this.cache.size,
+          newMarkets,
+          newlyDiscovered,
         },
       );
     } catch (error) {
@@ -93,6 +123,83 @@ export class OrderbookStream extends EventEmitter {
       consoleLog.error('SCAN', `Poll failed: ${msg}`, { error: msg });
     } finally {
       this.isPolling = false;
+    }
+  }
+
+  private loadSeenCache(): void {
+    try {
+      if (!fs.existsSync(this.seenCachePath)) return;
+      const raw = fs.readFileSync(this.seenCachePath, 'utf8');
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as Record<string, { firstSeenAt: string; lastSeenAt: string }>;
+      for (const [marketId, entry] of Object.entries(parsed)) {
+        if (!entry?.firstSeenAt || !entry?.lastSeenAt) continue;
+        this.seenMarkets.set(marketId, {
+          firstSeenAt: entry.firstSeenAt,
+          lastSeenAt: entry.lastSeenAt,
+        });
+      }
+      if (this.seenMarkets.size > 0) {
+        logger.info(
+          { count: this.seenMarkets.size },
+          'OrderbookStream loaded persistent market cache',
+        );
+      }
+    } catch (error) {
+      logger.warn({ error }, 'OrderbookStream failed to load persistent market cache');
+    }
+  }
+
+  private persistSeenCache(): void {
+    try {
+      const dir = path.dirname(this.seenCachePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const payload: Record<string, { firstSeenAt: string; lastSeenAt: string }> = {};
+      for (const [marketId, entry] of this.seenMarkets.entries()) {
+        payload[marketId] = { firstSeenAt: entry.firstSeenAt, lastSeenAt: entry.lastSeenAt };
+      }
+      fs.writeFileSync(this.seenCachePath, JSON.stringify(payload, null, 2));
+    } catch (error) {
+      logger.warn({ error }, 'OrderbookStream failed to persist market cache');
+    }
+  }
+
+  private updateSeenCache(markets: MarketData[]): number {
+    if (markets.length === 0) return 0;
+    const now = new Date().toISOString();
+    let newlyDiscovered = 0;
+
+    for (const market of markets) {
+      const existing = this.seenMarkets.get(market.marketId);
+      if (!existing) {
+        newlyDiscovered++;
+        this.seenMarkets.set(market.marketId, { firstSeenAt: now, lastSeenAt: now });
+      } else {
+        existing.lastSeenAt = now;
+      }
+    }
+
+    return newlyDiscovered;
+  }
+
+  /** Evict oldest entries from cache and seenMarkets when they exceed limits */
+  private evictStaleEntries(): void {
+    if (this.cache.size > OrderbookStream.MAX_CACHE_SIZE) {
+      const excess = this.cache.size - OrderbookStream.MAX_CACHE_SIZE;
+      const iter = this.cache.keys();
+      for (let i = 0; i < excess; i++) {
+        const key = iter.next().value;
+        if (key !== undefined) this.cache.delete(key);
+      }
+    }
+    if (this.seenMarkets.size > OrderbookStream.MAX_SEEN_MARKETS) {
+      const entries = [...this.seenMarkets.entries()].sort((a, b) =>
+        a[1].lastSeenAt.localeCompare(b[1].lastSeenAt),
+      );
+      const excess = this.seenMarkets.size - OrderbookStream.MAX_SEEN_MARKETS;
+      for (let i = 0; i < excess; i++) {
+        this.seenMarkets.delete(entries[i][0]);
+      }
     }
   }
 }

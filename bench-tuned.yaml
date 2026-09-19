@@ -1,0 +1,143 @@
+# Benchmark comparison config — TUNED convergence preset.
+#
+# Identical to bench.yaml except for the strategy_config block below. Run both
+# against the SAME tape and compare the Target bar output:
+#
+#   PAPER_FEE_RATE=0.04 npm run replay -- --tape tape.jsonl --config bench.yaml
+#   PAPER_FEE_RATE=0.04 npm run replay -- --tape tape.jsonl --config bench-tuned.yaml
+#
+# Two runs rather than two wallets because strategy_config is keyed by strategy
+# name, not wallet id (engine.ts:59) — two convergence wallets in one run would
+# share one config.
+#
+# Original header follows.
+#
+# Benchmark comparison config.
+#
+#   1. record a tape:  bun run src/cli.ts start --config config.yaml --record tape.jsonl
+#   2. compare:        PAPER_FEE_RATE=0.04 npm run replay -- --tape tape.jsonl --config bench.yaml
+#
+# Every wallet sees the SAME tape, so differences are the strategy, not the
+# market. A strategy that cannot beat the benchmarks is not earning its keep.
+#
+# SET PAPER_FEE_RATE. Markets whose tape entry carried no fee schedule are
+# replayed with ZERO fees otherwise, which silently overstates every edge in
+# the table. Use the decimal rate from the fee table for the markets you
+# recorded: 0.04 politics, 0.05 sports, 0.07 crypto. Replay warns when it is
+# unset — the warning is not decorative.
+#
+# The run also prints a "Target bar" block: win rate and max drawdown per
+# strategy wallet against TARGET_WIN_RATE / TARGET_MAX_DD (default 0.9 / 0.1).
+# A wallet with too few closed trades reports UNPROVEN, not PASSED.
+
+environment:
+  enable_live_trading: false   # replay forces PAPER regardless; belt and braces
+
+wallets:
+  # ── Your strategies ──
+  - id: strat_market_making
+    mode: PAPER
+    strategy: spread_enhanced
+    capital: 10000
+    risk_limits:
+      max_position_size: 500
+      max_exposure_per_market: 2000
+      max_daily_loss: 500
+      max_open_trades: 50
+      max_drawdown: 0.5
+
+  - id: strat_convergence
+    mode: PAPER
+    strategy: filtered_high_prob_convergence
+    capital: 10000
+    risk_limits:
+      max_position_size: 500
+      max_exposure_per_market: 2000
+      max_daily_loss: 500
+      max_open_trades: 50
+      max_drawdown: 0.5
+
+  # ── Null benchmarks — baselines, not strategies ──
+  - id: bench_random           # does your market selection beat a coin flip?
+    mode: PAPER
+    strategy: benchmark_random
+    capital: 10000
+    risk_limits:
+      max_position_size: 500
+      max_exposure_per_market: 2000
+      max_daily_loss: 500
+      max_open_trades: 50
+      max_drawdown: 0.5
+
+  - id: bench_always_quote     # does MM machinery beat quoting blindly?
+    mode: PAPER
+    strategy: benchmark_always_quote
+    capital: 10000
+    risk_limits:
+      max_position_size: 500
+      max_exposure_per_market: 2000
+      max_daily_loss: 500
+      max_open_trades: 50
+      max_drawdown: 0.5
+
+  - id: bench_buy_and_hold     # does trading beat just being long?
+    mode: PAPER
+    strategy: benchmark_buy_and_hold
+    capital: 10000
+    risk_limits:
+      max_position_size: 500
+      max_exposure_per_market: 2000
+      max_daily_loss: 500
+      max_open_trades: 50
+      max_drawdown: 0.5
+
+strategy_config:
+  filtered_high_prob_convergence:
+    enabled: true
+
+    # ── Market selection ──
+    # max_prob is the important one. config.yaml currently runs 0.96, which is
+    # the longshot-selling regime: buying at 0.96 wins ~24 times in 25 and loses
+    # 24x the win on the 25th. That prints a beautiful win rate and a terrible
+    # payoff profile. 0.88 keeps the asymmetry survivable.
+    min_prob: 0.72
+    max_prob: 0.88
+    min_liquidity_usd: 10000
+    max_spread_bps: 80              # wider spreads are pure cost on entry+exit
+    max_days_to_resolution: 14
+    spike_pct: 0.08
+    spike_lookback_minutes: 60
+    min_depth_usd_within_1pct: 3000 # thin books are where slippage eats the edge
+    min_imbalance: 0.10
+    flow_lookback_minutes: 15
+    min_net_buy_flow_usd: 500
+    max_correlated_exposure_pct: 0.20
+
+    # ── Position sizing ──
+    base_risk_pct: 0.004
+    max_position_usd_per_market: 150
+    max_total_open_positions: 10
+
+    # ── Entry ──
+    ttl_seconds: 120
+    allow_take_on_momentum: false
+
+    # ── Exit ──
+    take_profit_bps: 200
+    stop_loss_bps: 120
+
+    time_exit_hours: 48
+
+    # ── Risk ──
+    # This is what actually holds the <10% drawdown target, not the entry
+    # filters. sizeThrottle ramps position size down from half this value and
+    # reaches zero here, so realised drawdown converges on 6% rather than
+    # crashing through it at full size. Set below the 10% target on purpose:
+    # the limit is where sizing stops, not where losses stop, since open
+    # positions still move after the throttle bites.
+    max_weekly_drawdown_pct: 0.06
+    max_daily_loss_pct: 0.02
+    max_market_mle_pct: 0.04
+    max_total_mle_pct: 0.12
+    max_orders_per_minute: 10
+    max_cancel_rate: 0.5

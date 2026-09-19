@@ -7,15 +7,18 @@
     "bot": "dist/cli.js"
   },
   "scripts": {
-    "dev": "bun run --max-old-space-size=4096 src/cli.ts start --config config.yaml",
+    "dev": "bun run --watch --max-old-space-size=4096 src/cli.ts start --config config.yaml",
     "build": "tsc -p tsconfig.json",
-    "start": "node --max-old-space-size=4096 dist/cli.js start --config config.yaml",
+    "start": "bun run --max-old-space-size=4096 dist/cli.js start --config config.yaml",
     "test": "vitest run",
     "lint": "eslint . --ext .ts",
     "format": "prettier --check .",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "replay": "bun run src/cli.ts replay"
   },
   "dependencies": {
+    "@ethersproject/wallet": "^5.8.0",
+    "@polymarket/clob-client": "^5.8.1",
     "commander": "^12.1.0",
     "pino": "^9.3.2",
     "pino-pretty": "^11.2.0",

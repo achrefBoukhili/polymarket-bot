@@ -7,18 +7,26 @@ import { DEFAULT_WHALE_CONFIG, type WhaleTrade } from '../src/whales/whale_types
 
 const TEST_DB_PATH = path.join(__dirname, '.test_whale_analytics.db');
 
+/** WAL mode writes -wal and -shm beside the database; all three must go. */
+function removeDb(): void {
+  for (const suffix of ['', '-wal', '-shm']) {
+    const f = TEST_DB_PATH + suffix;
+    if (fs.existsSync(f)) fs.unlinkSync(f);
+  }
+}
+
 let db: WhaleDB;
 let analytics: WhaleAnalytics;
 
 beforeEach(() => {
-  if (fs.existsSync(TEST_DB_PATH)) fs.unlinkSync(TEST_DB_PATH);
+  removeDb();
   db = new WhaleDB(TEST_DB_PATH);
   analytics = new WhaleAnalytics(db, { ...DEFAULT_WHALE_CONFIG });
 });
 
 afterEach(() => {
   db.close();
-  if (fs.existsSync(TEST_DB_PATH)) fs.unlinkSync(TEST_DB_PATH);
+  removeDb();
 });
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

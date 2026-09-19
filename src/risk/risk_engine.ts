@@ -1,6 +1,21 @@
 import { OrderRequest, WalletState } from '../types';
 import { KillSwitch } from './kill_switch';
 import { consoleLog } from '../reporting/console_log';
+import { logger } from '../reporting/logs';
+import {
+  RiskStateStore,
+  newRiskState,
+  rollDay,
+  dailyPnl,
+  markToMarket,
+  drawdownPct,
+} from './risk_state';
+
+/** Resolves the current mark for a position, or undefined if unknown. */
+export type MarkPriceSource = (marketId: string, outcome: 'YES' | 'NO') => number | undefined;
+
+/** Polymarket's minimum order value. Override only if the venue changes it. */
+const MIN_ORDER_NOTIONAL_USD = Number(process.env.MIN_ORDER_NOTIONAL_USD ?? 1);
 
 export class RiskEngine {
   private readonly killSwitch: KillSwitch;
@@ -14,8 +29,19 @@ export class RiskEngine {
   /** Total MLE (max loss at resolution) per wallet */
   private walletMle = new Map<string, number>();
 
-  constructor(killSwitch: KillSwitch) {
+  /** Day anchors and high-water marks, persisted across restarts. */
+  private readonly store: RiskStateStore;
+
+  /** Live marks. Until set, drawdown falls back to cost basis and says so. */
+  private markPrice: MarkPriceSource = () => undefined;
+
+  constructor(killSwitch: KillSwitch, store = new RiskStateStore()) {
     this.killSwitch = killSwitch;
+    this.store = store;
+  }
+
+  setMarkPriceSource(source: MarkPriceSource): void {
+    this.markPrice = source;
   }
 
   check(order: OrderRequest, wallet: WalletState): { ok: boolean; reason?: string } {
@@ -26,11 +52,26 @@ export class RiskEngine {
       return { ok: false, reason: 'Global kill switch active' };
     }
 
+    /* ── Minimum notional ──
+       Polymarket rejects orders under ~$1. Sizing formulas that scale off
+       capital silently emit 1-share (sub-$1) orders at small capital, which
+       the exchange then refuses. Fail here, visibly, instead. */
+    const notional = order.price * Math.abs(order.size);
+    if (notional < MIN_ORDER_NOTIONAL_USD) {
+      return {
+        ok: false,
+        reason: `Order notional $${notional.toFixed(2)} below exchange minimum $${MIN_ORDER_NOTIONAL_USD.toFixed(2)}`,
+      };
+    }
+
     /* ── Balance check: prevent spending more than available ── */
     if (order.side === 'BUY') {
       const orderCost = order.price * order.size;
       if (orderCost > wallet.availableBalance) {
-        return { ok: false, reason: `Insufficient balance: need $${orderCost.toFixed(2)}, have $${wallet.availableBalance.toFixed(2)}` };
+        return {
+          ok: false,
+          reason: `Insufficient balance: need $${orderCost.toFixed(2)}, have $${wallet.availableBalance.toFixed(2)}`,
+        };
       }
     }
 
@@ -43,16 +84,45 @@ export class RiskEngine {
       return { ok: false, reason: 'Max open trades exceeded' };
     }
 
-    if (wallet.realizedPnl <= -wallet.riskLimits.maxDailyLoss) {
-      return { ok: false, reason: 'Max daily loss breached' };
+    /* ── Mark to market: the basis for both daily PnL and drawdown ── */
+    const marked = markToMarket(wallet.openPositions, this.markPrice);
+    const equity = wallet.capitalAllocated + wallet.realizedPnl + marked.unrealizedPnl;
+
+    /* ── Daily loss, anchored to the start of the UTC day ── */
+    let riskState = this.store.get(wallet.walletId);
+    if (!riskState) {
+      // First sight of this wallet: today starts here.
+      riskState = newRiskState(wallet.realizedPnl, equity);
+    }
+    riskState = rollDay(riskState, wallet.realizedPnl);
+    if (equity > riskState.peakEquity) {
+      riskState = { ...riskState, peakEquity: equity };
+    }
+    this.store.set(wallet.walletId, riskState);
+
+    const todayPnl = dailyPnl(riskState, wallet.realizedPnl);
+    if (todayPnl <= -wallet.riskLimits.maxDailyLoss) {
+      const reason = `Max daily loss breached on ${wallet.walletId}: $${todayPnl.toFixed(2)} today (limit $${wallet.riskLimits.maxDailyLoss})`;
+      // ponytail: trips the GLOBAL switch. Right with one wallet, and the
+      // point of a daily loss limit is that everything stops and resting
+      // orders come off. Scope it per wallet if you ever run several.
+      this.killSwitch.activate(reason);
+      return { ok: false, reason };
     }
 
-    /* ── Drawdown check ── */
-    const drawdownPct = wallet.capitalAllocated > 0
-      ? (wallet.capitalAllocated - wallet.availableBalance - this.getTotalUnrealisedValue(wallet)) / wallet.capitalAllocated
-      : 0;
-    if (drawdownPct > wallet.riskLimits.maxDrawdown) {
-      return { ok: false, reason: `Drawdown ${(drawdownPct * 100).toFixed(1)}% exceeds limit ${(wallet.riskLimits.maxDrawdown * 100).toFixed(1)}%` };
+    /* ── Drawdown: peak-to-trough on mark-to-market equity ── */
+    const drawdown = drawdownPct(riskState.peakEquity, equity);
+    if (drawdown > wallet.riskLimits.maxDrawdown) {
+      if (marked.unpriced > 0) {
+        logger.warn(
+          { walletId: wallet.walletId, unpriced: marked.unpriced },
+          'Drawdown computed with unpriced positions valued at cost — figure understates risk',
+        );
+      }
+      return {
+        ok: false,
+        reason: `Drawdown ${(drawdown * 100).toFixed(1)}% from peak $${riskState.peakEquity.toFixed(2)} exceeds limit ${(wallet.riskLimits.maxDrawdown * 100).toFixed(1)}%`,
+      };
     }
 
     /* ── Per-market MLE check ── */
@@ -65,7 +135,7 @@ export class RiskEngine {
     }
 
     /* ── Rate limiting: max orders per minute per wallet ── */
-    const rateLimit = wallet.mode === 'PAPER' ? 120 : 20;
+    const rateLimit = wallet.mode === 'PAPER' ? 120 : 120;
     const now = Date.now();
     const stamps = this.orderTimestamps.get(wallet.walletId) ?? [];
     const recentStamps = stamps.filter((t) => now - t < 60_000);
@@ -83,7 +153,10 @@ export class RiskEngine {
     const now = Date.now();
     const cancels = this.cancelCounts.get(walletId) ?? [];
     cancels.push(now);
-    this.cancelCounts.set(walletId, cancels.filter((t) => now - t < 300_000));
+    this.cancelCounts.set(
+      walletId,
+      cancels.filter((t) => now - t < 300_000),
+    );
   }
 
   /** Get the cancel rate over the last 5 minutes */
@@ -95,11 +168,10 @@ export class RiskEngine {
     return cancels.length / orders.length;
   }
 
-  /** Approximate total unrealised value of open positions */
-  private getTotalUnrealisedValue(wallet: WalletState): number {
-    return wallet.openPositions.reduce(
-      (sum, p) => sum + Math.abs(p.avgPrice * p.size),
-      0,
-    );
+  /** Clean up tracking data for a removed wallet */
+  removeWallet(walletId: string): void {
+    this.orderTimestamps.delete(walletId);
+    this.cancelCounts.delete(walletId);
+    this.walletMle.delete(walletId);
   }
 }

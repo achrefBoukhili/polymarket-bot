@@ -30,6 +30,9 @@ interface GammaMarket {
   negRisk?: boolean;
   orderMinSize?: number;
   orderPriceMinTickSize?: number;
+  /* Per-market fee parameters — the authority, rather than a category guess */
+  feesEnabled?: boolean;
+  feeSchedule?: { rate?: number; exponent?: number; takerOnly?: boolean; rebateRate?: number };
 }
 
 export class MarketFetcher {
@@ -57,6 +60,29 @@ export class MarketFetcher {
       return markets;
     } catch (error) {
       logger.error({ error }, 'Failed to fetch markets from Gamma API');
+      return [];
+    }
+  }
+
+  /**
+   * Fetch specific markets by id, INCLUDING closed ones.
+   *
+   * fetchSnapshot() queries active=true&closed=false, so a market that
+   * resolves simply vanishes from the feed — which is exactly when we need
+   * to look at it, because we may still be holding it.
+   */
+  async fetchMarketsByIds(ids: string[]): Promise<GammaMarket[]> {
+    if (ids.length === 0) return [];
+    try {
+      const query = ids.map((id) => `id=${encodeURIComponent(id)}`).join('&');
+      const response = await fetch(`${this.gammaApi}/markets?${query}&limit=${ids.length}`);
+      if (!response.ok) {
+        logger.error({ status: response.status, ids: ids.length }, 'Gamma market lookup failed');
+        return [];
+      }
+      return (await response.json()) as GammaMarket[];
+    } catch (error) {
+      logger.error({ error, ids: ids.length }, 'Gamma market lookup threw');
       return [];
     }
   }
@@ -150,6 +176,16 @@ export class MarketFetcher {
           oneDayPriceChange: m.oneDayPriceChange ?? undefined,
           oneWeekPriceChange: m.oneWeekPriceChange ?? undefined,
           negRisk: m.negRisk ?? undefined,
+          feeSchedule:
+            m.feesEnabled && m.feeSchedule?.rate
+              ? {
+                  rate: m.feeSchedule.rate,
+                  exponent: m.feeSchedule.exponent ?? 1,
+                  takerOnly: m.feeSchedule.takerOnly ?? true,
+                  rebateRate: m.feeSchedule.rebateRate ?? 0,
+                  enabled: true,
+                }
+              : { rate: 0, enabled: false },
           orderMinSize: m.orderMinSize ?? undefined,
           orderPriceMinTickSize: m.orderPriceMinTickSize ?? undefined,
         });

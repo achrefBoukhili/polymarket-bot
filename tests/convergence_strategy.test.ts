@@ -496,12 +496,31 @@ describe('FilteredHighProbConvergence — Risk Integration', () => {
       strategy.onMarketUpdate(mkMarket({ timestamp: Date.now() - (5 - i) * 60_000 }));
     }
 
-    const signals1 = strategy.generateSignals();
-    const orders1 = strategy.sizePositions(signals1);
-    // Second call should hit cooldown
-    const signals2 = strategy.generateSignals();
-    const orders2 = strategy.sizePositions(signals2);
-    // First pass may produce 1, second should produce 0 (cooldown)
+    const orders1 = strategy.sizePositions(strategy.generateSignals());
+
+    // The cooldown arms when the engine reports the order working — on a fill
+    // or on it resting — not merely because we sized it. Sizing twice without
+    // that feedback is not what the engine does.
+    for (const order of orders1) strategy.notifyFill(order);
+
+    const orders2 = strategy.sizePositions(strategy.generateSignals());
+    if (orders1.length > 0) {
+      expect(orders2.length).toBe(0);
+    }
+  });
+
+  it('arms the cooldown on a resting order too, not only on a fill', () => {
+    const strategy = createStrategy();
+    strategy.onMarketUpdate(mkMarket());
+    for (let i = 0; i < 5; i++) {
+      strategy.onMarketUpdate(mkMarket({ timestamp: Date.now() - (5 - i) * 60_000 }));
+    }
+
+    const orders1 = strategy.sizePositions(strategy.generateSignals());
+    // An unfilled order is still working, so it must block a re-quote.
+    for (const order of orders1) strategy.notifyResting(order);
+
+    const orders2 = strategy.sizePositions(strategy.generateSignals());
     if (orders1.length > 0) {
       expect(orders2.length).toBe(0);
     }

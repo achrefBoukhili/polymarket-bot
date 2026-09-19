@@ -1,0 +1,78 @@
+# Benchmark comparison config.
+#
+#   1. record a tape:  bun run src/cli.ts start --config config.yaml --record tape.jsonl
+#   2. compare:        PAPER_FEE_RATE=0.04 npm run replay -- --tape tape.jsonl --config bench.yaml
+#
+# Every wallet sees the SAME tape, so differences are the strategy, not the
+# market. A strategy that cannot beat the benchmarks is not earning its keep.
+#
+# SET PAPER_FEE_RATE. Markets whose tape entry carried no fee schedule are
+# replayed with ZERO fees otherwise, which silently overstates every edge in
+# the table. Use the decimal rate from the fee table for the markets you
+# recorded: 0.04 politics, 0.05 sports, 0.07 crypto. Replay warns when it is
+# unset — the warning is not decorative.
+#
+# The run also prints a "Target bar" block: win rate and max drawdown per
+# strategy wallet against TARGET_WIN_RATE / TARGET_MAX_DD (default 0.9 / 0.1).
+# A wallet with too few closed trades reports UNPROVEN, not PASSED.
+
+environment:
+  enable_live_trading: false   # replay forces PAPER regardless; belt and braces
+
+wallets:
+  # ── Your strategies ──
+  - id: strat_market_making
+    mode: PAPER
+    strategy: spread_enhanced
+    capital: 10000
+    risk_limits:
+      max_position_size: 500
+      max_exposure_per_market: 2000
+      max_daily_loss: 500
+      max_open_trades: 50
+      max_drawdown: 0.5
+
+  - id: strat_convergence
+    mode: PAPER
+    strategy: filtered_high_prob_convergence
+    capital: 10000
+    risk_limits:
+      max_position_size: 500
+      max_exposure_per_market: 2000
+      max_daily_loss: 500
+      max_open_trades: 50
+      max_drawdown: 0.5
+
+  # ── Null benchmarks — baselines, not strategies ──
+  - id: bench_random           # does your market selection beat a coin flip?
+    mode: PAPER
+    strategy: benchmark_random
+    capital: 10000
+    risk_limits:
+      max_position_size: 500
+      max_exposure_per_market: 2000
+      max_daily_loss: 500
+      max_open_trades: 50
+      max_drawdown: 0.5
+
+  - id: bench_always_quote     # does MM machinery beat quoting blindly?
+    mode: PAPER
+    strategy: benchmark_always_quote
+    capital: 10000
+    risk_limits:
+      max_position_size: 500
+      max_exposure_per_market: 2000
+      max_daily_loss: 500
+      max_open_trades: 50
+      max_drawdown: 0.5
+
+  - id: bench_buy_and_hold     # does trading beat just being long?
+    mode: PAPER
+    strategy: benchmark_buy_and_hold
+    capital: 10000
+    risk_limits:
+      max_position_size: 500
+      max_exposure_per_market: 2000
+      max_daily_loss: 500
+      max_open_trades: 50
+      max_drawdown: 0.5

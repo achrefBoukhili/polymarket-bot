@@ -12,7 +12,16 @@ wallets:
   #     max_daily_loss: 150
   #     max_open_trades: 10
   #     max_drawdown: 0.2
-
+  # - id: market_making_5_live
+  #   mode: LIVE
+  #   strategy: spread_enhanced
+  #   capital: 5
+  #   risk_limits:
+  #     max_position_size: 25
+  #     max_exposure_per_market: 1
+  #     max_daily_loss: 50
+  #     max_open_trades: 30
+  #     max_drawdown: 0.40
   # - id: wallet_2
   #   mode: PAPER
   #   strategy: ai_forecast
@@ -44,13 +53,23 @@ wallets:
   # - id: paper_cross_market_arb
   #   mode: PAPER
   #   strategy: cross_market_arbitrage
-  #   capital: 1000
+  #   capital: 10
   #   risk_limits:
   #     max_position_size: 100
   #     max_exposure_per_market: 1000
   #     max_daily_loss: 500
   #     max_open_trades: 50
   #     max_drawdown: 0.10
+  - id: paper_cross_market_arb_100
+    mode: PAPER
+    strategy: cross_market_arbitrage
+    capital: 100
+    risk_limits:
+      max_position_size: 50
+      max_exposure_per_market: 1000
+      max_daily_loss: 50
+      max_open_trades: 50
+      max_drawdown: 0.10
 
   # - id: paper_mispricing_arb
   #   mode: PAPER
@@ -94,26 +113,26 @@ wallets:
   #     max_daily_loss: 500
   #     max_open_trades: 50
   #     max_drawdown: 0.10
-  - id: paper_market_making_5
-    mode: PAPER
-    strategy: market_making
-    capital: 5
-    risk_limits:
-      max_position_size: 5
-      max_exposure_per_market: 10
-      max_daily_loss: 500
-      max_open_trades: 50
-      max_drawdown: 0.10
-  - id: paper_enhanced_linear_inventory_1000
-    mode: PAPER
-    strategy: enhanced_linear_inventory
-    capital: 1000
-    risk_limits:
-      max_position_size: 500
-      max_exposure_per_market: 1000
-      max_daily_loss: 500
-      max_open_trades: 50
-      max_drawdown: 0.10
+  # - id: paper_market_making_5
+  #   mode: PAPER
+  #   strategy: spread_enhanced
+  #   capital: 5
+  #   risk_limits:
+  #     max_position_size: 5
+  #     max_exposure_per_market: 10
+  #     max_daily_loss: 500
+  #     max_open_trades: 50
+  #     max_drawdown: 0.10
+  # - id: paper_enhanced_linear_inventory_1000
+  #   mode: PAPER
+  #   strategy: spread_enhanced
+  #   capital: 1000
+  #   risk_limits:
+  #     max_position_size: 500
+  #     max_exposure_per_market: 1000
+  #     max_daily_loss: 500
+  #     max_open_trades: 50
+  #     max_drawdown: 0.10
 
   # - id: paper_momentum
   #   mode: PAPER
@@ -137,16 +156,16 @@ wallets:
   #     max_open_trades: 50
   #     max_drawdown: 0.10
 
-  # - id: paper_convergence
-  #   mode: PAPER
-  #   strategy: filtered_high_prob_convergence
-  #   capital: 10000
-  #   risk_limits:
-  #     max_position_size: 500
-  #     max_exposure_per_market: 1000
-  #     max_daily_loss: 500
-  #     max_open_trades: 50
-  #     max_drawdown: 0.10
+  - id: paper_convergence
+    mode: PAPER
+    strategy: filtered_high_prob_convergence
+    capital: 100
+    risk_limits:
+      max_position_size: 50
+      max_exposure_per_market: 1000
+      max_daily_loss: 50
+      max_open_trades: 50
+      max_drawdown: 0.10
 
   # - id: paper_copy_trade
   #   mode: PAPER
@@ -363,7 +382,7 @@ whale_tracking:
 
     # ── On-chain Wallet Balance Lookup ──
     polygonRpcUrl: https://polygon-rpc.com
-    usdcContractAddress: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    usdcContractAddress: "0x328545f73b431e235e60a8e8988ad1b7e9a4a437"
 
     # ── Whale Network Graph ──
     networkGraphEnabled: true

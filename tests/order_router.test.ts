@@ -4,7 +4,7 @@ import { RiskEngine } from '../src/risk/risk_engine';
 import { KillSwitch } from '../src/risk/kill_switch';
 import { TradeExecutor } from '../src/execution/trade_executor';
 import { WalletManager } from '../src/wallets/wallet_manager';
-import { OrderRequest, WalletState } from '../src/types';
+import { OrderRequest, WalletState, FillResult } from '../src/types';
 
 class StubWallet {
   public called = false;
@@ -18,8 +18,9 @@ class StubWallet {
   updateBalance(): void {
     return;
   }
-  async placeOrder(): Promise<void> {
+  async placeOrder(): Promise<FillResult> {
     this.called = true;
+    return { orderId: 'stub-1', filledSize: 10, restingSize: 0 };
   }
 }
 

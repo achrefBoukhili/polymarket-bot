@@ -1,6 +1,7 @@
 import http from 'http';
 import { WalletManager } from '../wallets/wallet_manager';
 import { PaperWallet } from '../wallets/paper_wallet';
+import { PolymarketWallet } from '../wallets/polymarket_wallet';
 import { MarketFetcher } from '../data/market_fetcher';
 import { buildDashboardPayload } from './dashboard_api';
 import { listStrategies } from '../strategies/registry';
@@ -8,7 +9,9 @@ import { logger } from './logs';
 import { consoleLog } from './console_log';
 import type { WhaleAPI } from '../whales/whale_api';
 import type { Engine } from '../core/engine';
+import { KillSwitch } from '../risk/kill_switch';
 import { CopyTradeStrategy } from '../strategies/copy_trading/copy_trade_strategy';
+import { drawdown } from './statistics';
 
 /* ──────────────────────────────────────────────────────────────
    Strategy catalog — rich metadata used by the Strategies tab
@@ -70,7 +73,11 @@ interface StrategyCatalogEntry {
    ────────────────────────────────────────────────────────────── */
 import type { WalletState, TradeRecord, Position } from '../types';
 
-function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPrices?: Map<string, number>) {
+function buildWalletDetail(
+  wallet: WalletState,
+  trades: TradeRecord[],
+  marketPrices?: Map<string, number>,
+) {
   const sorted = [...trades].sort((a, b) => a.timestamp - b.timestamp);
 
   /* ── Basic stats ── */
@@ -82,10 +89,17 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
   const closedTrades = wins.length + losses.length;
   const winRate = closedTrades > 0 ? wins.length / closedTrades : 0;
   const avgWin = wins.length > 0 ? wins.reduce((s, t) => s + t.realizedPnl, 0) / wins.length : 0;
-  const avgLoss = losses.length > 0 ? losses.reduce((s, t) => s + t.realizedPnl, 0) / losses.length : 0;
-  const profitFactor = losses.length > 0 && avgLoss !== 0
-    ? Math.abs(wins.reduce((s, t) => s + t.realizedPnl, 0) / losses.reduce((s, t) => s + t.realizedPnl, 0))
-    : wins.length > 0 ? Infinity : 0;
+  const avgLoss =
+    losses.length > 0 ? losses.reduce((s, t) => s + t.realizedPnl, 0) / losses.length : 0;
+  const profitFactor =
+    losses.length > 0 && avgLoss !== 0
+      ? Math.abs(
+          wins.reduce((s, t) => s + t.realizedPnl, 0) /
+            losses.reduce((s, t) => s + t.realizedPnl, 0),
+        )
+      : wins.length > 0
+        ? Infinity
+        : 0;
   const largestWin = wins.length > 0 ? Math.max(...wins.map((t) => t.realizedPnl)) : 0;
   const largestLoss = losses.length > 0 ? Math.min(...losses.map((t) => t.realizedPnl)) : 0;
 
@@ -98,18 +112,14 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
   }
 
   /* ── Drawdown calculation ── */
-  let peak = wallet.capitalAllocated;
-  let maxDrawdown = 0;
-  let maxDrawdownPct = 0;
-  const drawdownTimeline: { ts: number; drawdown: number; drawdownPct: number }[] = [];
-  for (const pt of pnlTimeline) {
-    if (pt.balance > peak) peak = pt.balance;
-    const dd = peak - pt.balance;
-    const ddPct = peak > 0 ? dd / peak : 0;
-    if (dd > maxDrawdown) maxDrawdown = dd;
-    if (ddPct > maxDrawdownPct) maxDrawdownPct = ddPct;
-    drawdownTimeline.push({ ts: pt.ts, drawdown: round(dd), drawdownPct: round4(ddPct) });
-  }
+  const dd = drawdown(sorted, wallet.capitalAllocated);
+  const maxDrawdown = dd.maxDrawdown;
+  const maxDrawdownPct = dd.maxDrawdownPct;
+  const drawdownTimeline = dd.timeline.map((p) => ({
+    ts: p.ts,
+    drawdown: round(p.drawdown),
+    drawdownPct: round4(p.drawdownPct),
+  }));
 
   /* ── Streak analysis ── */
   let currentStreak = 0;
@@ -118,23 +128,48 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
   let ws = 0;
   let ls = 0;
   for (const t of sorted) {
-    if (t.realizedPnl > 0) { ws++; ls = 0; longestWinStreak = Math.max(longestWinStreak, ws); }
-    else if (t.realizedPnl < 0) { ls++; ws = 0; longestLossStreak = Math.max(longestLossStreak, ls); }
+    if (t.realizedPnl > 0) {
+      ws++;
+      ls = 0;
+      longestWinStreak = Math.max(longestWinStreak, ws);
+    } else if (t.realizedPnl < 0) {
+      ls++;
+      ws = 0;
+      longestLossStreak = Math.max(longestLossStreak, ls);
+    }
   }
   currentStreak = ws > 0 ? ws : -ls;
 
   /* ── Per-market breakdown ── */
-  const byMarket = new Map<string, {
-    marketId: string; trades: number; buyVol: number; sellVol: number;
-    realizedPnl: number; avgEntry: number; avgExit: number;
-    entryQty: number; exitQty: number; outcome: string;
-  }>();
+  const byMarket = new Map<
+    string,
+    {
+      marketId: string;
+      trades: number;
+      buyVol: number;
+      sellVol: number;
+      realizedPnl: number;
+      avgEntry: number;
+      avgExit: number;
+      entryQty: number;
+      exitQty: number;
+      outcome: string;
+    }
+  >();
   for (const t of sorted) {
     const key = `${t.marketId}:${t.outcome}`;
     if (!byMarket.has(key)) {
       byMarket.set(key, {
-        marketId: t.marketId, trades: 0, buyVol: 0, sellVol: 0,
-        realizedPnl: 0, avgEntry: 0, avgExit: 0, entryQty: 0, exitQty: 0, outcome: t.outcome,
+        marketId: t.marketId,
+        trades: 0,
+        buyVol: 0,
+        sellVol: 0,
+        realizedPnl: 0,
+        avgEntry: 0,
+        avgExit: 0,
+        entryQty: 0,
+        exitQty: 0,
+        outcome: t.outcome,
       });
     }
     const m = byMarket.get(key)!;
@@ -171,10 +206,15 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
 
   /* ── Risk utilization ── */
   const capitalUsed = wallet.capitalAllocated - wallet.availableBalance;
-  const capitalUtilization = wallet.capitalAllocated > 0 ? capitalUsed / wallet.capitalAllocated : 0;
+  const capitalUtilization =
+    wallet.capitalAllocated > 0 ? capitalUsed / wallet.capitalAllocated : 0;
   const dailyLossUsed = Math.abs(Math.min(0, wallet.realizedPnl));
-  const dailyLossUtilization = wallet.riskLimits.maxDailyLoss > 0 ? dailyLossUsed / wallet.riskLimits.maxDailyLoss : 0;
-  const openTradeUtilization = wallet.riskLimits.maxOpenTrades > 0 ? wallet.openPositions.length / wallet.riskLimits.maxOpenTrades : 0;
+  const dailyLossUtilization =
+    wallet.riskLimits.maxDailyLoss > 0 ? dailyLossUsed / wallet.riskLimits.maxDailyLoss : 0;
+  const openTradeUtilization =
+    wallet.riskLimits.maxOpenTrades > 0
+      ? wallet.openPositions.length / wallet.riskLimits.maxOpenTrades
+      : 0;
 
   return {
     wallet: {
@@ -215,18 +255,27 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
       longestWinStreak,
       longestLossStreak,
       currentStreak,
-      unrealizedPnl: round(wallet.openPositions.reduce((sum, p) => {
-        const cp = marketPrices?.get(p.marketId) ?? p.avgPrice;
-        return sum + (p.size > 0 && p.avgPrice > 0 ? (cp - p.avgPrice) * p.size : 0);
-      }, 0)),
-      totalPnl: round(wallet.realizedPnl + wallet.openPositions.reduce((sum, p) => {
-        const cp = marketPrices?.get(p.marketId) ?? p.avgPrice;
-        return sum + (p.size > 0 && p.avgPrice > 0 ? (cp - p.avgPrice) * p.size : 0);
-      }, 0)),
-      roi: round4((wallet.realizedPnl + wallet.openPositions.reduce((sum, p) => {
-        const cp = marketPrices?.get(p.marketId) ?? p.avgPrice;
-        return sum + (p.size > 0 && p.avgPrice > 0 ? (cp - p.avgPrice) * p.size : 0);
-      }, 0)) / Math.max(1, wallet.capitalAllocated)),
+      unrealizedPnl: round(
+        wallet.openPositions.reduce((sum, p) => {
+          const cp = marketPrices?.get(p.marketId) ?? p.avgPrice;
+          return sum + (p.size > 0 && p.avgPrice > 0 ? (cp - p.avgPrice) * p.size : 0);
+        }, 0),
+      ),
+      totalPnl: round(
+        wallet.realizedPnl +
+          wallet.openPositions.reduce((sum, p) => {
+            const cp = marketPrices?.get(p.marketId) ?? p.avgPrice;
+            return sum + (p.size > 0 && p.avgPrice > 0 ? (cp - p.avgPrice) * p.size : 0);
+          }, 0),
+      ),
+      roi: round4(
+        (wallet.realizedPnl +
+          wallet.openPositions.reduce((sum, p) => {
+            const cp = marketPrices?.get(p.marketId) ?? p.avgPrice;
+            return sum + (p.size > 0 && p.avgPrice > 0 ? (cp - p.avgPrice) * p.size : 0);
+          }, 0)) /
+          Math.max(1, wallet.capitalAllocated),
+      ),
     },
     risk: {
       capitalUtilization: round4(capitalUtilization),
@@ -253,8 +302,12 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
   };
 }
 
-function round(v: number, d = 2): number { return Number(v.toFixed(d)); }
-function round4(v: number): number { return Number(v.toFixed(4)); }
+function round(v: number, d = 2): number {
+  return Number(v.toFixed(d));
+}
+function round4(v: number): number {
+  return Number(v.toFixed(4));
+}
 
 function getStrategyCatalog(): StrategyCatalogEntry[] {
   return [
@@ -284,7 +337,7 @@ function getStrategyCatalog(): StrategyCatalogEntry[] {
       category: 'Arbitrage',
       riskLevel: 'Low',
       description:
-        'Identifies outcomes whose probabilities don\'t sum correctly. In a binary market (Yes/No), prices should sum to ~$1.00. When they don\'t, there is a risk-free profit.',
+        "Identifies outcomes whose probabilities don't sum correctly. In a binary market (Yes/No), prices should sum to ~$1.00. When they don't, there is a risk-free profit.",
       howItWorks: [
         'Fetches all outcomes for each market',
         'Sums the prices (e.g., Yes $0.55 + No $0.40 = $0.95)',
@@ -368,7 +421,13 @@ function getStrategyCatalog(): StrategyCatalogEntry[] {
       riskLevel: 'Medium',
       version: '1.0.0',
       author: 'Built-in',
-      tags: ['whale-tracking', 'copy-trading', 'address-based', 'configurable-risk', 'mirror-or-inverse'],
+      tags: [
+        'whale-tracking',
+        'copy-trading',
+        'address-based',
+        'configurable-risk',
+        'mirror-or-inverse',
+      ],
       description:
         'Automatically mirrors (or inverses) trades made by specified whale wallet addresses on Polymarket. Polls the data API for new whale trades and replicates them with full risk management.',
       longDescription:
@@ -402,7 +461,7 @@ function getStrategyCatalog(): StrategyCatalogEntry[] {
         'Fetches recent trades from each tracked whale address via the Polymarket data API',
         'Filters out trades older than max_trade_age_seconds (default 5 minutes)',
         'Skips trades on blacklisted markets or below minimum size',
-        'In mirror mode: copies the whale\'s exact direction (BUY YES → BUY YES)',
+        "In mirror mode: copies the whale's exact direction (BUY YES → BUY YES)",
         'In inverse mode: takes the opposite side (whale BUY YES → SELL / BUY NO)',
         'Checks per-whale performance — skips whales below min_whale_win_rate',
         'Checks daily volume cap and max open positions before entering',
@@ -420,17 +479,20 @@ function getStrategyCatalog(): StrategyCatalogEntry[] {
         },
         {
           name: 'Trailing Stop',
-          description: 'Activates after trailing_activate_bps profit, then exits if price retraces by trailing_stop_bps from the high-water mark.',
+          description:
+            'Activates after trailing_activate_bps profit, then exits if price retraces by trailing_stop_bps from the high-water mark.',
           configKeys: ['trailing_stop_bps', 'trailing_activate_bps'],
         },
         {
           name: 'Time Exit',
-          description: 'Closes position after time_exit_minutes regardless of PnL to prevent capital lock-up.',
+          description:
+            'Closes position after time_exit_minutes regardless of PnL to prevent capital lock-up.',
           configKeys: ['time_exit_minutes'],
         },
         {
           name: 'Whale Exit Detection',
-          description: 'When the whale exits their position (detected via API polling), automatically closes the copy position.',
+          description:
+            'When the whale exits their position (detected via API polling), automatically closes the copy position.',
           configKeys: ['exit_on_whale_exit'],
         },
       ],
@@ -444,36 +506,222 @@ function getStrategyCatalog(): StrategyCatalogEntry[] {
         'Maximum simultaneous positions enforced by max_open_positions',
       ],
       riskControls: [
-        { name: 'Per-Whale Win Rate', description: 'Pauses copying a whale if their win rate drops below threshold', configKey: 'min_whale_win_rate' },
-        { name: 'Consecutive Loss Cooldown', description: 'Pauses a whale after N consecutive losing trades for a configurable cooldown period', configKey: 'max_consecutive_losses' },
-        { name: 'Max Drawdown', description: 'Pauses all copy trading if total drawdown exceeds threshold', configKey: 'max_drawdown_pct' },
-        { name: 'Daily Volume Cap', description: 'Stops opening new positions once daily volume limit is reached', configKey: 'max_daily_volume_usd' },
-        { name: 'Max Open Positions', description: 'Limits concurrent open positions to prevent overexposure', configKey: 'max_open_positions' },
-        { name: 'Per-Market Exposure', description: 'Caps exposure to any single market', configKey: 'max_exposure_per_market_usd' },
-        { name: 'Trade Age Filter', description: 'Ignores whale trades older than max_trade_age_seconds to avoid stale signals', configKey: 'max_trade_age_seconds' },
-        { name: 'Market Blacklist', description: 'Skip specific markets that should not be copied' },
+        {
+          name: 'Per-Whale Win Rate',
+          description: 'Pauses copying a whale if their win rate drops below threshold',
+          configKey: 'min_whale_win_rate',
+        },
+        {
+          name: 'Consecutive Loss Cooldown',
+          description:
+            'Pauses a whale after N consecutive losing trades for a configurable cooldown period',
+          configKey: 'max_consecutive_losses',
+        },
+        {
+          name: 'Max Drawdown',
+          description: 'Pauses all copy trading if total drawdown exceeds threshold',
+          configKey: 'max_drawdown_pct',
+        },
+        {
+          name: 'Daily Volume Cap',
+          description: 'Stops opening new positions once daily volume limit is reached',
+          configKey: 'max_daily_volume_usd',
+        },
+        {
+          name: 'Max Open Positions',
+          description: 'Limits concurrent open positions to prevent overexposure',
+          configKey: 'max_open_positions',
+        },
+        {
+          name: 'Per-Market Exposure',
+          description: 'Caps exposure to any single market',
+          configKey: 'max_exposure_per_market_usd',
+        },
+        {
+          name: 'Trade Age Filter',
+          description:
+            'Ignores whale trades older than max_trade_age_seconds to avoid stale signals',
+          configKey: 'max_trade_age_seconds',
+        },
+        {
+          name: 'Market Blacklist',
+          description: 'Skip specific markets that should not be copied',
+        },
       ],
       configSchema: [
-        { key: 'copy_mode', label: 'Copy Mode', type: 'string', default: 'mirror', description: 'mirror = follow whale, inverse = fade whale', group: 'General' },
-        { key: 'size_mode', label: 'Size Mode', type: 'string', default: 'fixed', description: 'How to size copy positions: fixed, proportional, or kelly', group: 'General' },
-        { key: 'fixed_size', label: 'Fixed Size', type: 'number', default: 10, unit: 'USD', description: 'Dollar amount per trade in fixed mode', group: 'Sizing' },
-        { key: 'proportional_factor', label: 'Proportional Factor', type: 'number', default: 0.1, description: 'Fraction of whale size to copy in proportional mode', group: 'Sizing' },
-        { key: 'max_position_size_usd', label: 'Max Position Size', type: 'number', default: 200, unit: 'USD', description: 'Hard cap on any single copy trade', group: 'Sizing' },
-        { key: 'max_exposure_per_market_usd', label: 'Max Market Exposure', type: 'number', default: 500, unit: 'USD', description: 'Max total exposure per market', group: 'Sizing' },
-        { key: 'max_daily_volume_usd', label: 'Max Daily Volume', type: 'number', default: 2000, unit: 'USD', description: 'Daily volume cap across all copy trades', group: 'Sizing' },
-        { key: 'max_open_positions', label: 'Max Open Positions', type: 'number', default: 10, description: 'Maximum concurrent positions', group: 'Sizing' },
-        { key: 'poll_interval_seconds', label: 'Poll Interval', type: 'number', default: 30, unit: 'sec', description: 'Seconds between whale trade API polls', group: 'Polling' },
-        { key: 'max_trade_age_seconds', label: 'Max Trade Age', type: 'number', default: 300, unit: 'sec', description: 'Ignore whale trades older than this', group: 'Polling' },
-        { key: 'min_trade_size_usd', label: 'Min Trade Size', type: 'number', default: 10, unit: 'USD', description: 'Ignore whale trades smaller than this', group: 'Polling' },
-        { key: 'stop_loss_bps', label: 'Stop Loss', type: 'number', default: 500, unit: 'bps', description: 'Close position on this much loss', group: 'Exit' },
-        { key: 'take_profit_bps', label: 'Take Profit', type: 'number', default: 300, unit: 'bps', description: 'Close position on this much profit', group: 'Exit' },
-        { key: 'trailing_stop_bps', label: 'Trailing Stop', type: 'number', default: 150, unit: 'bps', description: 'Trailing stop distance from high-water mark', group: 'Exit' },
-        { key: 'trailing_activate_bps', label: 'Trailing Activation', type: 'number', default: 200, unit: 'bps', description: 'Profit needed before trailing stop activates', group: 'Exit' },
-        { key: 'time_exit_minutes', label: 'Time Exit', type: 'number', default: 120, unit: 'min', description: 'Close position after this many minutes', group: 'Exit' },
-        { key: 'min_whale_win_rate', label: 'Min Whale Win Rate', type: 'number', default: 0.50, description: 'Pause copying whale if win rate drops below this', group: 'Risk' },
-        { key: 'max_drawdown_pct', label: 'Max Drawdown', type: 'number', default: 0.15, description: 'Pause all trading if drawdown exceeds this %', group: 'Risk' },
-        { key: 'max_consecutive_losses', label: 'Max Consecutive Losses', type: 'number', default: 5, description: 'Pause whale after this many losses in a row', group: 'Risk' },
-        { key: 'cooldown_after_loss_seconds', label: 'Loss Cooldown', type: 'number', default: 300, unit: 'sec', description: 'Cooldown period after consecutive loss limit', group: 'Risk' },
+        {
+          key: 'copy_mode',
+          label: 'Copy Mode',
+          type: 'string',
+          default: 'mirror',
+          description: 'mirror = follow whale, inverse = fade whale',
+          group: 'General',
+        },
+        {
+          key: 'size_mode',
+          label: 'Size Mode',
+          type: 'string',
+          default: 'fixed',
+          description: 'How to size copy positions: fixed, proportional, or kelly',
+          group: 'General',
+        },
+        {
+          key: 'fixed_size',
+          label: 'Fixed Size',
+          type: 'number',
+          default: 10,
+          unit: 'USD',
+          description: 'Dollar amount per trade in fixed mode',
+          group: 'Sizing',
+        },
+        {
+          key: 'proportional_factor',
+          label: 'Proportional Factor',
+          type: 'number',
+          default: 0.1,
+          description: 'Fraction of whale size to copy in proportional mode',
+          group: 'Sizing',
+        },
+        {
+          key: 'max_position_size_usd',
+          label: 'Max Position Size',
+          type: 'number',
+          default: 200,
+          unit: 'USD',
+          description: 'Hard cap on any single copy trade',
+          group: 'Sizing',
+        },
+        {
+          key: 'max_exposure_per_market_usd',
+          label: 'Max Market Exposure',
+          type: 'number',
+          default: 500,
+          unit: 'USD',
+          description: 'Max total exposure per market',
+          group: 'Sizing',
+        },
+        {
+          key: 'max_daily_volume_usd',
+          label: 'Max Daily Volume',
+          type: 'number',
+          default: 2000,
+          unit: 'USD',
+          description: 'Daily volume cap across all copy trades',
+          group: 'Sizing',
+        },
+        {
+          key: 'max_open_positions',
+          label: 'Max Open Positions',
+          type: 'number',
+          default: 10,
+          description: 'Maximum concurrent positions',
+          group: 'Sizing',
+        },
+        {
+          key: 'poll_interval_seconds',
+          label: 'Poll Interval',
+          type: 'number',
+          default: 30,
+          unit: 'sec',
+          description: 'Seconds between whale trade API polls',
+          group: 'Polling',
+        },
+        {
+          key: 'max_trade_age_seconds',
+          label: 'Max Trade Age',
+          type: 'number',
+          default: 300,
+          unit: 'sec',
+          description: 'Ignore whale trades older than this',
+          group: 'Polling',
+        },
+        {
+          key: 'min_trade_size_usd',
+          label: 'Min Trade Size',
+          type: 'number',
+          default: 10,
+          unit: 'USD',
+          description: 'Ignore whale trades smaller than this',
+          group: 'Polling',
+        },
+        {
+          key: 'stop_loss_bps',
+          label: 'Stop Loss',
+          type: 'number',
+          default: 500,
+          unit: 'bps',
+          description: 'Close position on this much loss',
+          group: 'Exit',
+        },
+        {
+          key: 'take_profit_bps',
+          label: 'Take Profit',
+          type: 'number',
+          default: 300,
+          unit: 'bps',
+          description: 'Close position on this much profit',
+          group: 'Exit',
+        },
+        {
+          key: 'trailing_stop_bps',
+          label: 'Trailing Stop',
+          type: 'number',
+          default: 150,
+          unit: 'bps',
+          description: 'Trailing stop distance from high-water mark',
+          group: 'Exit',
+        },
+        {
+          key: 'trailing_activate_bps',
+          label: 'Trailing Activation',
+          type: 'number',
+          default: 200,
+          unit: 'bps',
+          description: 'Profit needed before trailing stop activates',
+          group: 'Exit',
+        },
+        {
+          key: 'time_exit_minutes',
+          label: 'Time Exit',
+          type: 'number',
+          default: 120,
+          unit: 'min',
+          description: 'Close position after this many minutes',
+          group: 'Exit',
+        },
+        {
+          key: 'min_whale_win_rate',
+          label: 'Min Whale Win Rate',
+          type: 'number',
+          default: 0.5,
+          description: 'Pause copying whale if win rate drops below this',
+          group: 'Risk',
+        },
+        {
+          key: 'max_drawdown_pct',
+          label: 'Max Drawdown',
+          type: 'number',
+          default: 0.15,
+          description: 'Pause all trading if drawdown exceeds this %',
+          group: 'Risk',
+        },
+        {
+          key: 'max_consecutive_losses',
+          label: 'Max Consecutive Losses',
+          type: 'number',
+          default: 5,
+          description: 'Pause whale after this many losses in a row',
+          group: 'Risk',
+        },
+        {
+          key: 'cooldown_after_loss_seconds',
+          label: 'Loss Cooldown',
+          type: 'number',
+          default: 300,
+          unit: 'sec',
+          description: 'Cooldown period after consecutive loss limit',
+          group: 'Risk',
+        },
       ],
     },
     {
@@ -519,56 +767,64 @@ function getStrategyCatalog(): StrategyCatalogEntry[] {
       ],
       parameters: {
         'min_prob / max_prob': '65\u201396% — probability band for the leading outcome',
-        'max_spread_bps': '200 bps — maximum bid-ask spread allowed',
-        'max_days_to_resolution': '14 days — prefer short/medium horizons',
-        'spike_pct': '8% — reject markets with recent price spikes',
-        'min_imbalance': '10% — minimum orderbook imbalance or net flow required',
-        'base_risk_pct': '0.5% of capital per trade (before Setup Score scaling)',
+        max_spread_bps: '200 bps — maximum bid-ask spread allowed',
+        max_days_to_resolution: '14 days — prefer short/medium horizons',
+        spike_pct: '8% — reject markets with recent price spikes',
+        min_imbalance: '10% — minimum orderbook imbalance or net flow required',
+        base_risk_pct: '0.5% of capital per trade (before Setup Score scaling)',
         'take_profit / stop_loss': '+200 / -150 bps from entry',
-        'time_exit_hours': '48h — close stale positions',
+        time_exit_hours: '48h — close stale positions',
       },
-      idealFor: 'Conservative traders who want rule-based, explainable entries on high-probability markets without AI/research dependencies',
+      idealFor:
+        'Conservative traders who want rule-based, explainable entries on high-probability markets without AI/research dependencies',
       filters: [
         {
           name: 'liquidity',
           label: 'A) Liquidity Filter',
-          description: 'Requires minimum total liquidity AND estimated orderbook depth within 1% of mid-price. Rejects thin markets where execution would be poor.',
+          description:
+            'Requires minimum total liquidity AND estimated orderbook depth within 1% of mid-price. Rejects thin markets where execution would be poor.',
           configKeys: ['min_liquidity_usd', 'min_depth_usd_within_1pct'],
         },
         {
           name: 'probBand',
           label: 'B) Probability Band Filter',
-          description: 'Only considers markets where the leading outcome\u2019s implied probability (from midprice) falls within [min_prob, max_prob]. Avoids tiny-upside markets near 0.95\u20130.99 and low-conviction markets below 0.65.',
+          description:
+            'Only considers markets where the leading outcome\u2019s implied probability (from midprice) falls within [min_prob, max_prob]. Avoids tiny-upside markets near 0.95\u20130.99 and low-conviction markets below 0.65.',
           configKeys: ['min_prob', 'max_prob'],
         },
         {
           name: 'spread',
           label: 'C) Spread Filter',
-          description: 'Rejects markets where the bid-ask spread (in basis points relative to mid) exceeds the configured threshold. Wide spreads eat into profits and signal low market-maker interest.',
+          description:
+            'Rejects markets where the bid-ask spread (in basis points relative to mid) exceeds the configured threshold. Wide spreads eat into profits and signal low market-maker interest.',
           configKeys: ['max_spread_bps'],
         },
         {
           name: 'timeToRes',
           label: 'D) Time-to-Resolution Filter',
-          description: 'Prefers markets with known resolution dates within max_days_to_resolution. Skips markets with no endDate or those already past resolution. Short horizons reduce uncertainty and unlock capital faster.',
+          description:
+            'Prefers markets with known resolution dates within max_days_to_resolution. Skips markets with no endDate or those already past resolution. Short horizons reduce uncertainty and unlock capital faster.',
           configKeys: ['max_days_to_resolution'],
         },
         {
           name: 'antiChase',
           label: 'E) Anti-Chasing Filter',
-          description: 'Detects recent abnormal price spikes and high realised volatility. If the price moved more than spike_pct over the lookback window, or if rolling volatility is elevated, the market is skipped to avoid buying the top.',
+          description:
+            'Detects recent abnormal price spikes and high realised volatility. If the price moved more than spike_pct over the lookback window, or if rolling volatility is elevated, the market is skipped to avoid buying the top.',
           configKeys: ['spike_pct', 'spike_lookback_minutes'],
         },
         {
           name: 'flow',
           label: 'F) Flow / Pressure Confirmation',
-          description: 'Computes an orderbook imbalance score (bid-size vs ask-size) and a net-buy-flow proxy from recent price action. Requires at least one supportive condition: imbalance \u2265 threshold OR net buy flow \u2265 threshold. No AI \u2014 pure market data.',
+          description:
+            'Computes an orderbook imbalance score (bid-size vs ask-size) and a net-buy-flow proxy from recent price action. Requires at least one supportive condition: imbalance \u2265 threshold OR net buy flow \u2265 threshold. No AI \u2014 pure market data.',
           configKeys: ['min_imbalance', 'flow_lookback_minutes', 'min_net_buy_flow_usd'],
         },
         {
           name: 'cluster',
           label: 'G) Correlation / Cluster Exposure Filter',
-          description: 'Groups markets by Gamma eventId or seriesSlug. Prevents overexposure to correlated outcomes (e.g., multiple markets on the same event). Enforces max_correlated_exposure_pct per wallet.',
+          description:
+            'Groups markets by Gamma eventId or seriesSlug. Prevents overexposure to correlated outcomes (e.g., multiple markets on the same event). Enforces max_correlated_exposure_pct per wallet.',
           configKeys: ['max_correlated_exposure_pct'],
         },
       ],
@@ -582,22 +838,26 @@ function getStrategyCatalog(): StrategyCatalogEntry[] {
       exitRules: [
         {
           name: 'Take Profit',
-          description: 'When the midprice rises by take_profit_bps above entry price, the position is closed. Locks in gains before potential mean reversion.',
+          description:
+            'When the midprice rises by take_profit_bps above entry price, the position is closed. Locks in gains before potential mean reversion.',
           configKeys: ['take_profit_bps'],
         },
         {
           name: 'Stop Loss',
-          description: 'When the midprice drops by stop_loss_bps below entry price, the position is closed immediately. Prevents small losses from becoming large ones.',
+          description:
+            'When the midprice drops by stop_loss_bps below entry price, the position is closed immediately. Prevents small losses from becoming large ones.',
           configKeys: ['stop_loss_bps'],
         },
         {
           name: 'Time Exit',
-          description: 'If a position has been open for time_exit_hours without hitting TP or SL, it is closed. Prevents capital from being locked in stale or illiquid positions.',
+          description:
+            'If a position has been open for time_exit_hours without hitting TP or SL, it is closed. Prevents capital from being locked in stale or illiquid positions.',
           configKeys: ['time_exit_hours'],
         },
         {
           name: 'Spread Widening Near Resolution',
-          description: 'If a market is within 1 day of resolution and its spread has widened to 2\u00d7 the max_spread_bps threshold, the position is closed to avoid getting stuck.',
+          description:
+            'If a market is within 1 day of resolution and its spread has widened to 2\u00d7 the max_spread_bps threshold, the position is closed to avoid getting stuck.',
           configKeys: ['max_spread_bps'],
         },
       ],
@@ -611,44 +871,286 @@ function getStrategyCatalog(): StrategyCatalogEntry[] {
         'Shares = floor(position_usd / entry_price), minimum 1 share',
       ],
       riskControls: [
-        { name: 'Daily Loss Limit', description: 'Strategy pauses all new entries if daily realised PnL drops below max_daily_loss_pct of capital', configKey: 'max_daily_loss_pct' },
-        { name: 'Weekly Drawdown Limit', description: 'Strategy pauses all new entries if weekly realised PnL drops below max_weekly_drawdown_pct of capital', configKey: 'max_weekly_drawdown_pct' },
-        { name: 'Per-Market MLE', description: 'Max loss at resolution for any single market capped at max_market_mle_pct of capital', configKey: 'max_market_mle_pct' },
-        { name: 'Total MLE', description: 'Aggregate max loss at resolution across all open positions capped at max_total_mle_pct of capital', configKey: 'max_total_mle_pct' },
-        { name: 'Cluster Exposure', description: 'Max exposure to correlated markets (same event/series) capped at max_correlated_exposure_pct of capital', configKey: 'max_correlated_exposure_pct' },
-        { name: 'Order Rate Limit', description: 'Max orders per minute per wallet to prevent runaway loops', configKey: 'max_orders_per_minute' },
-        { name: 'Cancel Rate Limit', description: 'If cancel rate exceeds max_cancel_rate, new entries are blocked', configKey: 'max_cancel_rate' },
-        { name: 'Global Kill Switch', description: 'External kill switch immediately disables all LIVE trading while keeping PAPER running for diagnostics' },
-        { name: '5-Minute Cooldown', description: 'Per-market/outcome/side cooldown of 300 seconds prevents repeated re-entry on the same signal' },
+        {
+          name: 'Daily Loss Limit',
+          description:
+            'Strategy pauses all new entries if daily realised PnL drops below max_daily_loss_pct of capital',
+          configKey: 'max_daily_loss_pct',
+        },
+        {
+          name: 'Weekly Drawdown Limit',
+          description:
+            'Strategy pauses all new entries if weekly realised PnL drops below max_weekly_drawdown_pct of capital',
+          configKey: 'max_weekly_drawdown_pct',
+        },
+        {
+          name: 'Per-Market MLE',
+          description:
+            'Max loss at resolution for any single market capped at max_market_mle_pct of capital',
+          configKey: 'max_market_mle_pct',
+        },
+        {
+          name: 'Total MLE',
+          description:
+            'Aggregate max loss at resolution across all open positions capped at max_total_mle_pct of capital',
+          configKey: 'max_total_mle_pct',
+        },
+        {
+          name: 'Cluster Exposure',
+          description:
+            'Max exposure to correlated markets (same event/series) capped at max_correlated_exposure_pct of capital',
+          configKey: 'max_correlated_exposure_pct',
+        },
+        {
+          name: 'Order Rate Limit',
+          description: 'Max orders per minute per wallet to prevent runaway loops',
+          configKey: 'max_orders_per_minute',
+        },
+        {
+          name: 'Cancel Rate Limit',
+          description: 'If cancel rate exceeds max_cancel_rate, new entries are blocked',
+          configKey: 'max_cancel_rate',
+        },
+        {
+          name: 'Global Kill Switch',
+          description:
+            'External kill switch immediately disables all LIVE trading while keeping PAPER running for diagnostics',
+        },
+        {
+          name: '5-Minute Cooldown',
+          description:
+            'Per-market/outcome/side cooldown of 300 seconds prevents repeated re-entry on the same signal',
+        },
       ],
       configSchema: [
-        { key: 'enabled', label: 'Enabled', type: 'boolean', default: true, description: 'Master switch for the strategy', group: 'General' },
-        { key: 'min_liquidity_usd', label: 'Min Liquidity', type: 'number', default: 10000, unit: 'USD', description: 'Minimum market liquidity to consider', group: 'Filters' },
-        { key: 'min_prob', label: 'Min Probability', type: 'number', default: 0.65, description: 'Lower bound of the probability band', group: 'Filters' },
-        { key: 'max_prob', label: 'Max Probability', type: 'number', default: 0.96, description: 'Upper bound of the probability band', group: 'Filters' },
-        { key: 'max_spread_bps', label: 'Max Spread', type: 'number', default: 200, unit: 'bps', description: 'Maximum bid-ask spread in basis points', group: 'Filters' },
-        { key: 'max_days_to_resolution', label: 'Max Days to Resolution', type: 'number', default: 14, unit: 'days', description: 'Reject markets resolving beyond this horizon', group: 'Filters' },
-        { key: 'spike_pct', label: 'Spike Threshold', type: 'number', default: 0.08, description: 'Max recent price move before anti-chasing triggers', group: 'Filters' },
-        { key: 'spike_lookback_minutes', label: 'Spike Lookback', type: 'number', default: 60, unit: 'min', description: 'Window for spike detection', group: 'Filters' },
-        { key: 'min_depth_usd_within_1pct', label: 'Min Depth', type: 'number', default: 500, unit: 'USD', description: 'Estimated orderbook depth within 1% of mid', group: 'Filters' },
-        { key: 'min_imbalance', label: 'Min Imbalance', type: 'number', default: 0.10, description: 'Minimum orderbook imbalance ratio', group: 'Filters' },
-        { key: 'flow_lookback_minutes', label: 'Flow Lookback', type: 'number', default: 15, unit: 'min', description: 'Window for net buy flow estimation', group: 'Filters' },
-        { key: 'min_net_buy_flow_usd', label: 'Min Net Buy Flow', type: 'number', default: 500, unit: 'USD', description: 'Minimum net buy flow in lookback window', group: 'Filters' },
-        { key: 'max_correlated_exposure_pct', label: 'Max Cluster Exposure', type: 'number', default: 0.25, description: 'Max % of capital exposed to correlated markets', group: 'Filters' },
-        { key: 'base_risk_pct', label: 'Base Risk %', type: 'number', default: 0.005, description: 'Fraction of capital risked per trade (before score scaling)', group: 'Sizing' },
-        { key: 'max_position_usd_per_market', label: 'Max Position / Market', type: 'number', default: 200, unit: 'USD', description: 'Hard cap on position size per market', group: 'Sizing' },
-        { key: 'max_total_open_positions', label: 'Max Open Positions', type: 'number', default: 10, description: 'Maximum simultaneous open positions', group: 'Sizing' },
-        { key: 'ttl_seconds', label: 'Order TTL', type: 'number', default: 120, unit: 'sec', description: 'Seconds before unfilled limit orders are cancelled', group: 'Entry' },
-        { key: 'allow_take_on_momentum', label: 'Allow Taker Entries', type: 'boolean', default: false, description: 'Permit crossing the spread when flow is strong', group: 'Entry' },
-        { key: 'take_profit_bps', label: 'Take Profit', type: 'number', default: 200, unit: 'bps', description: 'Close position when midprice rises this much', group: 'Exit' },
-        { key: 'stop_loss_bps', label: 'Stop Loss', type: 'number', default: 150, unit: 'bps', description: 'Close position when midprice drops this much', group: 'Exit' },
-        { key: 'time_exit_hours', label: 'Time Exit', type: 'number', default: 48, unit: 'hours', description: 'Close position after this many hours regardless', group: 'Exit' },
-        { key: 'max_daily_loss_pct', label: 'Max Daily Loss', type: 'number', default: 0.03, description: 'Pause entries if daily loss exceeds this % of capital', group: 'Risk' },
-        { key: 'max_weekly_drawdown_pct', label: 'Max Weekly Drawdown', type: 'number', default: 0.08, description: 'Pause entries if weekly loss exceeds this % of capital', group: 'Risk' },
-        { key: 'max_market_mle_pct', label: 'Max Market MLE', type: 'number', default: 0.05, description: 'Max loss at resolution per market as % of capital', group: 'Risk' },
-        { key: 'max_total_mle_pct', label: 'Max Total MLE', type: 'number', default: 0.15, description: 'Aggregate max loss at resolution as % of capital', group: 'Risk' },
-        { key: 'max_orders_per_minute', label: 'Max Orders/Min', type: 'number', default: 10, description: 'Rate limit on orders per wallet per minute', group: 'Risk' },
-        { key: 'max_cancel_rate', label: 'Max Cancel Rate', type: 'number', default: 0.5, description: 'Max ratio of cancels to orders in a 5-min window', group: 'Risk' },
+        {
+          key: 'enabled',
+          label: 'Enabled',
+          type: 'boolean',
+          default: true,
+          description: 'Master switch for the strategy',
+          group: 'General',
+        },
+        {
+          key: 'min_liquidity_usd',
+          label: 'Min Liquidity',
+          type: 'number',
+          default: 10000,
+          unit: 'USD',
+          description: 'Minimum market liquidity to consider',
+          group: 'Filters',
+        },
+        {
+          key: 'min_prob',
+          label: 'Min Probability',
+          type: 'number',
+          default: 0.65,
+          description: 'Lower bound of the probability band',
+          group: 'Filters',
+        },
+        {
+          key: 'max_prob',
+          label: 'Max Probability',
+          type: 'number',
+          default: 0.96,
+          description: 'Upper bound of the probability band',
+          group: 'Filters',
+        },
+        {
+          key: 'max_spread_bps',
+          label: 'Max Spread',
+          type: 'number',
+          default: 200,
+          unit: 'bps',
+          description: 'Maximum bid-ask spread in basis points',
+          group: 'Filters',
+        },
+        {
+          key: 'max_days_to_resolution',
+          label: 'Max Days to Resolution',
+          type: 'number',
+          default: 14,
+          unit: 'days',
+          description: 'Reject markets resolving beyond this horizon',
+          group: 'Filters',
+        },
+        {
+          key: 'spike_pct',
+          label: 'Spike Threshold',
+          type: 'number',
+          default: 0.08,
+          description: 'Max recent price move before anti-chasing triggers',
+          group: 'Filters',
+        },
+        {
+          key: 'spike_lookback_minutes',
+          label: 'Spike Lookback',
+          type: 'number',
+          default: 60,
+          unit: 'min',
+          description: 'Window for spike detection',
+          group: 'Filters',
+        },
+        {
+          key: 'min_depth_usd_within_1pct',
+          label: 'Min Depth',
+          type: 'number',
+          default: 500,
+          unit: 'USD',
+          description: 'Estimated orderbook depth within 1% of mid',
+          group: 'Filters',
+        },
+        {
+          key: 'min_imbalance',
+          label: 'Min Imbalance',
+          type: 'number',
+          default: 0.1,
+          description: 'Minimum orderbook imbalance ratio',
+          group: 'Filters',
+        },
+        {
+          key: 'flow_lookback_minutes',
+          label: 'Flow Lookback',
+          type: 'number',
+          default: 15,
+          unit: 'min',
+          description: 'Window for net buy flow estimation',
+          group: 'Filters',
+        },
+        {
+          key: 'min_net_buy_flow_usd',
+          label: 'Min Net Buy Flow',
+          type: 'number',
+          default: 500,
+          unit: 'USD',
+          description: 'Minimum net buy flow in lookback window',
+          group: 'Filters',
+        },
+        {
+          key: 'max_correlated_exposure_pct',
+          label: 'Max Cluster Exposure',
+          type: 'number',
+          default: 0.25,
+          description: 'Max % of capital exposed to correlated markets',
+          group: 'Filters',
+        },
+        {
+          key: 'base_risk_pct',
+          label: 'Base Risk %',
+          type: 'number',
+          default: 0.005,
+          description: 'Fraction of capital risked per trade (before score scaling)',
+          group: 'Sizing',
+        },
+        {
+          key: 'max_position_usd_per_market',
+          label: 'Max Position / Market',
+          type: 'number',
+          default: 200,
+          unit: 'USD',
+          description: 'Hard cap on position size per market',
+          group: 'Sizing',
+        },
+        {
+          key: 'max_total_open_positions',
+          label: 'Max Open Positions',
+          type: 'number',
+          default: 10,
+          description: 'Maximum simultaneous open positions',
+          group: 'Sizing',
+        },
+        {
+          key: 'ttl_seconds',
+          label: 'Order TTL',
+          type: 'number',
+          default: 120,
+          unit: 'sec',
+          description: 'Seconds before unfilled limit orders are cancelled',
+          group: 'Entry',
+        },
+        {
+          key: 'allow_take_on_momentum',
+          label: 'Allow Taker Entries',
+          type: 'boolean',
+          default: false,
+          description: 'Permit crossing the spread when flow is strong',
+          group: 'Entry',
+        },
+        {
+          key: 'take_profit_bps',
+          label: 'Take Profit',
+          type: 'number',
+          default: 200,
+          unit: 'bps',
+          description: 'Close position when midprice rises this much',
+          group: 'Exit',
+        },
+        {
+          key: 'stop_loss_bps',
+          label: 'Stop Loss',
+          type: 'number',
+          default: 150,
+          unit: 'bps',
+          description: 'Close position when midprice drops this much',
+          group: 'Exit',
+        },
+        {
+          key: 'time_exit_hours',
+          label: 'Time Exit',
+          type: 'number',
+          default: 48,
+          unit: 'hours',
+          description: 'Close position after this many hours regardless',
+          group: 'Exit',
+        },
+        {
+          key: 'max_daily_loss_pct',
+          label: 'Max Daily Loss',
+          type: 'number',
+          default: 0.03,
+          description: 'Pause entries if daily loss exceeds this % of capital',
+          group: 'Risk',
+        },
+        {
+          key: 'max_weekly_drawdown_pct',
+          label: 'Max Weekly Drawdown',
+          type: 'number',
+          default: 0.08,
+          description: 'Pause entries if weekly loss exceeds this % of capital',
+          group: 'Risk',
+        },
+        {
+          key: 'max_market_mle_pct',
+          label: 'Max Market MLE',
+          type: 'number',
+          default: 0.05,
+          description: 'Max loss at resolution per market as % of capital',
+          group: 'Risk',
+        },
+        {
+          key: 'max_total_mle_pct',
+          label: 'Max Total MLE',
+          type: 'number',
+          default: 0.15,
+          description: 'Aggregate max loss at resolution as % of capital',
+          group: 'Risk',
+        },
+        {
+          key: 'max_orders_per_minute',
+          label: 'Max Orders/Min',
+          type: 'number',
+          default: 10,
+          description: 'Rate limit on orders per wallet per minute',
+          group: 'Risk',
+        },
+        {
+          key: 'max_cancel_rate',
+          label: 'Max Cancel Rate',
+          type: 'number',
+          default: 0.5,
+          description: 'Max ratio of cancels to orders in a 5-min window',
+          group: 'Risk',
+        },
       ],
     },
   ];
@@ -689,9 +1191,29 @@ export class DashboardServer {
   private server?: http.Server;
   private whaleApi?: WhaleAPI;
   private engine?: Engine;
+  private killSwitch?: KillSwitch;
   private sseClients: Set<http.ServerResponse> = new Set();
   private sseInterval?: ReturnType<typeof setInterval>;
   private readonly walletDisplayNames = new Map<string, string>();
+
+  /**
+   * Loopback by default.  This API can create LIVE wallets, delete wallets and
+   * rewrite risk limits, and it has no authentication — it must not be
+   * reachable off-box without a deliberate opt-in.
+   */
+  private readonly host = process.env.DASHBOARD_HOST ?? '127.0.0.1';
+
+  /** Shared secret required for mutating requests. Unset = loopback only. */
+  private readonly token = process.env.DASHBOARD_TOKEN;
+
+  /** Requests that change state must be authorised; reads stay open. */
+  private authorised(req: http.IncomingMessage, method: string): boolean {
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return true;
+    if (!this.token) return true; // loopback-only deployment
+    const header = req.headers.authorization ?? '';
+    const bearer = header.startsWith('Bearer ') ? header.slice(7) : '';
+    return bearer === this.token || req.headers['x-dashboard-token'] === this.token;
+  }
 
   constructor(
     private readonly walletManager: WalletManager,
@@ -704,6 +1226,10 @@ export class DashboardServer {
 
   setEngine(engine: Engine): void {
     this.engine = engine;
+  }
+
+  setKillSwitch(killSwitch: KillSwitch): void {
+    this.killSwitch = killSwitch;
   }
 
   /** Build a live price map from the orderbook stream cache */
@@ -720,7 +1246,8 @@ export class DashboardServer {
   /** Get all running CopyTradeStrategy instances from the engine */
   private getCopyTradeInstances(): CopyTradeStrategy[] {
     if (!this.engine) return [];
-    return this.engine.getStrategiesByName('copy_trade')
+    return this.engine
+      .getStrategiesByName('copy_trade')
       .filter((s): s is CopyTradeStrategy => s instanceof CopyTradeStrategy);
   }
 
@@ -737,6 +1264,10 @@ export class DashboardServer {
       }
 
       try {
+        if (!this.authorised(req, req.method ?? 'GET')) {
+          json(res, 401, { ok: false, error: 'Unauthorized: DASHBOARD_TOKEN required for this request' });
+          return;
+        }
         await this.route(req, res, url);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -745,19 +1276,33 @@ export class DashboardServer {
       }
     });
 
-    this.server.listen(this.port, () => {
+    const offLoopback = this.host !== '127.0.0.1' && this.host !== 'localhost';
+    if (offLoopback && !this.token) {
+      // This API can create LIVE wallets, rewrite risk limits and trip the
+      // kill switch. Exposing it unauthenticated is not a choice we make for
+      // the operator silently.
+      throw new Error(
+        `Refusing to bind the dashboard to ${this.host} without DASHBOARD_TOKEN set. ` +
+          'Set DASHBOARD_TOKEN, or leave DASHBOARD_HOST unset to bind loopback only.',
+      );
+    }
+
+    this.server.listen(this.port, this.host, () => {
       logger.info(
-        { port: this.port, url: `http://localhost:${this.port}/dashboard` },
+        { host: this.host, port: this.port, url: `http://${this.host}:${this.port}/dashboard` },
         'Dashboard server listening',
       );
+      if (this.host !== '127.0.0.1' && this.host !== 'localhost') {
+        logger.warn(
+          { host: this.host },
+          'Dashboard is bound off-loopback and has NO authentication — anyone who can reach this port can create LIVE wallets and change risk limits',
+        );
+      }
     });
 
-    // Broadcast dashboard data to SSE clients periodically
-    // We use a slightly longer interval and only send if data changed significantly
-    let lastPayloadStr = '';
+    // Broadcast dashboard data to SSE clients every second
     this.sseInterval = setInterval(() => {
       if (this.sseClients.size === 0) return;
-
       const payload = buildDashboardPayload(
         this.walletManager.listWallets(),
         this.walletManager.getAllTradeHistories(),
@@ -765,24 +1310,6 @@ export class DashboardServer {
         this.engine?.getPausedWallets(),
         this.walletDisplayNames,
       );
-
-      // Deep compare by stringifying (excluding generatedAt which always changes)
-      const currentPayload = { ...payload, generatedAt: '' };
-      const currentPayloadStr = JSON.stringify(currentPayload);
-
-      if (currentPayloadStr === lastPayloadStr) {
-        // Send a small heartbeat instead of the full payload if nothing changed
-        for (const client of this.sseClients) {
-          try {
-            client.write(': heartbeat\n\n');
-          } catch {
-            this.sseClients.delete(client);
-          }
-        }
-        return;
-      }
-
-      lastPayloadStr = currentPayloadStr;
       const data = `event: dashboard\ndata: ${JSON.stringify(payload)}\n\n`;
       for (const client of this.sseClients) {
         try {
@@ -791,7 +1318,7 @@ export class DashboardServer {
           this.sseClients.delete(client);
         }
       }
-    }, 2000); // Increased from 1000ms to 2000ms
+    }, 1000);
   }
 
   stop(): void {
@@ -800,7 +1327,11 @@ export class DashboardServer {
       this.sseInterval = undefined;
     }
     for (const client of this.sseClients) {
-      try { client.end(); } catch { /* ignore */ }
+      try {
+        client.end();
+      } catch {
+        /* ignore */
+      }
     }
     this.sseClients.clear();
     if (!this.server) return;
@@ -826,13 +1357,40 @@ export class DashboardServer {
 
     /* ─── JSON: overview data (used by Dashboard tab) ─── */
     if (path === '/api/data' && method === 'GET') {
-      json(res, 200, buildDashboardPayload(
-        this.walletManager.listWallets(),
-        this.walletManager.getAllTradeHistories(),
-        this.getLiveMarketPrices(),
-        this.engine?.getPausedWallets(),
-        this.walletDisplayNames,
-      ));
+      json(
+        res,
+        200,
+        buildDashboardPayload(
+          this.walletManager.listWallets(),
+          this.walletManager.getAllTradeHistories(),
+          this.getLiveMarketPrices(),
+          this.engine?.getPausedWallets(),
+          this.walletDisplayNames,
+        ),
+      );
+      return;
+    }
+
+    /* ─── Kill switch: the only handle on the global stop ─── */
+    if (path === '/api/kill-switch' && method === 'GET') {
+      json(res, 200, this.killSwitch?.getStatus() ?? { active: false, error: 'not wired' });
+      return;
+    }
+
+    if (path === '/api/kill-switch' && method === 'POST') {
+      if (!this.killSwitch) {
+        json(res, 503, { ok: false, error: 'Kill switch not wired to this server' });
+        return;
+      }
+      const body = await readBody(req);
+      const active = body.active === true || body.active === 'true';
+      if (active) {
+        const reason = String(body.reason ?? 'manual (dashboard)');
+        this.killSwitch.activate(reason);
+      } else {
+        this.killSwitch.deactivate();
+      }
+      json(res, 200, { ok: true, ...this.killSwitch.getStatus() });
       return;
     }
 
@@ -887,22 +1445,23 @@ export class DashboardServer {
       const maxTrades = Number(body.maxOpenTrades ?? 10);
       const maxDd = Number(body.maxDrawdown ?? 0.2);
 
-      const wallet = new PaperWallet(
-        {
-          id: walletId,
-          mode: mode === 'LIVE' ? 'LIVE' : 'PAPER',
-          strategy,
-          capital,
-          riskLimits: {
-            maxPositionSize: maxPos,
-            maxExposurePerMarket: maxExp,
-            maxDailyLoss: maxLoss,
-            maxOpenTrades: maxTrades,
-            maxDrawdown: maxDd,
-          },
-        },
+      const walletConfig = {
+        id: walletId,
+        mode: mode === 'LIVE' ? ('LIVE' as const) : ('PAPER' as const),
         strategy,
-      );
+        capital,
+        riskLimits: {
+          maxPositionSize: maxPos,
+          maxExposurePerMarket: maxExp,
+          maxDailyLoss: maxLoss,
+          maxOpenTrades: maxTrades,
+          maxDrawdown: maxDd,
+        },
+      };
+      const wallet =
+        mode === 'LIVE'
+          ? new PolymarketWallet(walletConfig, strategy)
+          : new PaperWallet(walletConfig, strategy);
       this.walletManager.addWallet(wallet);
 
       /* Connect the new wallet to the engine so its strategy runs */
@@ -910,12 +1469,21 @@ export class DashboardServer {
         this.engine.addRunner(walletId, strategy);
       }
 
-      json(res, 201, { ok: true, message: `Wallet "${walletId}" created (${mode}, ${strategy}, $${capital})` });
+      json(res, 201, {
+        ok: true,
+        message: `Wallet "${walletId}" created (${mode}, ${strategy}, $${capital})`,
+      });
       return;
     }
 
     /* ─── JSON: delete wallet ─── */
-    if (path.startsWith('/api/wallets/') && !path.includes('/detail') && !path.includes('/pause') && !path.includes('/resume') && method === 'DELETE') {
+    if (
+      path.startsWith('/api/wallets/') &&
+      !path.includes('/detail') &&
+      !path.includes('/pause') &&
+      !path.includes('/resume') &&
+      method === 'DELETE'
+    ) {
       const walletId = decodeURIComponent(path.slice('/api/wallets/'.length));
       if (this.engine) {
         this.engine.removeRunner(walletId);
@@ -1008,23 +1576,39 @@ export class DashboardServer {
         if (typeof wallet.updateRiskLimits === 'function') {
           const rl: Record<string, number> = {};
           const rlBody = body.riskLimits as Record<string, unknown>;
-          for (const key of ['maxPositionSize', 'maxExposurePerMarket', 'maxDailyLoss', 'maxOpenTrades', 'maxDrawdown']) {
+          for (const key of [
+            'maxPositionSize',
+            'maxExposurePerMarket',
+            'maxDailyLoss',
+            'maxOpenTrades',
+            'maxDrawdown',
+          ]) {
             if (rlBody[key] !== undefined && typeof rlBody[key] === 'number') {
               rl[key] = rlBody[key] as number;
             }
           }
           if (Object.keys(rl).length > 0) {
             wallet.updateRiskLimits(rl);
-            changes.push(`riskLimits updated: ${Object.entries(rl).map(([k,v]) => `${k}=${v}`).join(', ')}`);
+            changes.push(
+              `riskLimits updated: ${Object.entries(rl)
+                .map(([k, v]) => `${k}=${v}`)
+                .join(', ')}`,
+            );
           }
         } else {
-          json(res, 400, { ok: false, error: 'This wallet type does not support risk limit updates' });
+          json(res, 400, {
+            ok: false,
+            error: 'This wallet type does not support risk limit updates',
+          });
           return;
         }
       }
 
       if (changes.length === 0) {
-        json(res, 400, { ok: false, error: 'No valid fields to update. Supported: displayName, riskLimits' });
+        json(res, 400, {
+          ok: false,
+          error: 'No valid fields to update. Supported: displayName, riskLimits',
+        });
         return;
       }
 
@@ -1059,7 +1643,8 @@ export class DashboardServer {
       }
       /* Attach live config from YAML if available */
       const liveConfig = this.walletManager
-        ? this.walletManager.listWallets()
+        ? this.walletManager
+            .listWallets()
             .filter((w) => w.assignedStrategy === stratId)
             .map((w) => ({
               walletId: w.walletId,
@@ -1092,7 +1677,7 @@ export class DashboardServer {
           tradesCopied: p?.tradesCopied ?? 0,
           wins: p?.wins ?? 0,
           losses: p?.losses ?? 0,
-          winRate: p && (p.wins + p.losses) > 0 ? p.wins / (p.wins + p.losses) : 0,
+          winRate: p && p.wins + p.losses > 0 ? p.wins / (p.wins + p.losses) : 0,
           totalPnlBps: p?.totalPnlBps ?? 0,
           consecutiveLosses: p?.consecutiveLosses ?? 0,
           paused: p ? p.pausedUntil > Date.now() : false,
@@ -1105,7 +1690,7 @@ export class DashboardServer {
     /* ─── JSON: Copy Trade whale addresses — POST (add) ─── */
     if (path === '/api/copy-trade/whales' && method === 'POST') {
       const body = await readBody(req);
-      const address = (body.address as string || '').trim();
+      const address = ((body.address as string) || '').trim();
       if (!address) {
         json(res, 400, { ok: false, error: 'Missing "address" field' });
         return;
@@ -1120,7 +1705,10 @@ export class DashboardServer {
         if (inst.addWhaleAddress(address)) added = true;
       }
       if (added) {
-        json(res, 200, { ok: true, message: `Whale address "${address}" added to ${instances.length} copy trade instance(s)` });
+        json(res, 200, {
+          ok: true,
+          message: `Whale address "${address}" added to ${instances.length} copy trade instance(s)`,
+        });
       } else {
         json(res, 409, { ok: false, error: `Address "${address}" is already being tracked` });
       }
@@ -1234,8 +1822,14 @@ export class DashboardServer {
       const winRate = sells > 0 ? winningTrades / sells : 0;
       const totalVolume = trades.reduce((s, t) => s + t.cost, 0);
       const avgTradeSize = totalTrades > 0 ? totalVolume / totalTrades : 0;
-      const bestTrade = trades.reduce((best, t) => (t.realizedPnl > best ? t.realizedPnl : best), 0);
-      const worstTrade = trades.reduce((worst, t) => (t.realizedPnl < worst ? t.realizedPnl : worst), 0);
+      const bestTrade = trades.reduce(
+        (best, t) => (t.realizedPnl > best ? t.realizedPnl : best),
+        0,
+      );
+      const worstTrade = trades.reduce(
+        (worst, t) => (t.realizedPnl < worst ? t.realizedPnl : worst),
+        0,
+      );
 
       json(res, 200, {
         walletId,
@@ -1283,7 +1877,7 @@ export class DashboardServer {
     /* ─── Console API routes ─── */
     if (path === '/api/console/stream' && method === 'GET') {
       consoleLog.addSSEClient(res);
-      return;                // SSE connection stays open
+      return; // SSE connection stays open
     }
 
     if (path === '/api/console/logs' && method === 'GET') {
@@ -1307,7 +1901,7 @@ export class DashboardServer {
         Connection: 'keep-alive',
         'Access-Control-Allow-Origin': '*',
       });
-      res.write(':\n\n');  // comment to establish connection
+      res.write(':\n\n'); // comment to establish connection
 
       this.sseClients.add(res);
       req.on('close', () => this.sseClients.delete(res));
@@ -3293,7 +3887,7 @@ function renderWhaleList(data){
         '<span class="whale-stat '+pnlCls+'"><span class="ws-val">'+(w.totalPnlBps>0?'+':'')+w.totalPnlBps+'</span> bps</span>'+
         '<span class="whale-stat"><span class="ws-val">'+w.consecutiveLosses+'</span> streak</span>'+
       '</div>'+
-      '<button class="whale-remove-btn" onclick="removeWhale(\\''+w.address+'\\')">\u2716 Remove</button>'+
+      '<button class="whale-remove-btn" onclick="removeWhale(\\\''+w.address+'\\\')">\u2716 Remove</button>'+
     '</div>';
   }).join('');
 }
