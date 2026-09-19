@@ -137,15 +137,27 @@ export interface Drawdown {
 /**
  * Peak-to-trough drawdown over a trade history.
  *
+ * Measured on the realised equity curve — `startingCapital + cumulativePnl` —
+ * and deliberately NOT on `balanceAfter`. That field is cash
+ * (`availableBalance`), so buying a position drops it by the full cost and
+ * registers as a drawdown even though the account holds an asset of equal
+ * value. A metric that fires whenever capital is deployed would flag every
+ * strategy that puts more than the limit to work.
+ *
  * The high-water mark starts at `startingCapital`, so a strategy that is
  * down from day one shows a drawdown immediately rather than only after
  * it sets a new peak.
  *
  * Trades are sorted by timestamp here: callers hand us database rows, and
  * an out-of-order pair silently understates the trough.
+ *
+ * ponytail: realised only — an open position that is deep underwater shows
+ * nothing until it closes, so this understates live drawdown. Feed it
+ * mark-to-market equity points if unrealised drawdown needs to be caught
+ * while the position is still open.
  */
 export function drawdown(
-  trades: Array<{ timestamp: number; balanceAfter: number }>,
+  trades: Array<{ timestamp: number; cumulativePnl: number }>,
   startingCapital: number,
 ): Drawdown {
   const sorted = [...trades].sort((a, b) => a.timestamp - b.timestamp);
@@ -156,8 +168,9 @@ export function drawdown(
   const timeline: DrawdownPoint[] = [];
 
   for (const t of sorted) {
-    if (t.balanceAfter > peak) peak = t.balanceAfter;
-    const dd = peak - t.balanceAfter;
+    const equity = startingCapital + t.cumulativePnl;
+    if (equity > peak) peak = equity;
+    const dd = peak - equity;
     const ddPct = peak > 0 ? dd / peak : 0;
     if (dd > maxDrawdown) maxDrawdown = dd;
     if (ddPct > maxDrawdownPct) maxDrawdownPct = ddPct;

@@ -143,31 +143,40 @@ describe('AttributionTracker', () => {
 });
 
 describe('drawdown', () => {
-  const t = (timestamp: number, balanceAfter: number) => ({ timestamp, balanceAfter });
+  // cumulativePnl, i.e. equity = 1000 + cumulativePnl
+  const t = (timestamp: number, cumulativePnl: number) => ({ timestamp, cumulativePnl });
 
   it('measures peak-to-trough, not first-to-last', () => {
-    // 1000 → 1200 (peak) → 900 (trough) → 1100.
+    // equity 1000 → 1200 (peak) → 900 (trough) → 1100.
     // End-to-end is +100, but the account was down 300 from its high.
-    const d = drawdown([t(1, 1000), t(2, 1200), t(3, 900), t(4, 1100)], 1000);
+    const d = drawdown([t(1, 0), t(2, 200), t(3, -100), t(4, 100)], 1000);
     expect(d.maxDrawdown).toBe(300);
     expect(d.maxDrawdownPct).toBeCloseTo(300 / 1200);
   });
 
   it('counts a fall below starting capital before any new peak is set', () => {
-    const d = drawdown([t(1, 900), t(2, 950)], 1000);
+    const d = drawdown([t(1, -100), t(2, -50)], 1000);
     expect(d.maxDrawdown).toBe(100);
     expect(d.maxDrawdownPct).toBeCloseTo(0.1);
   });
 
   it('sorts by timestamp — out-of-order rows would hide the trough', () => {
-    const ordered = drawdown([t(1, 1000), t(2, 700), t(3, 1000)], 1000);
-    const shuffled = drawdown([t(3, 1000), t(1, 1000), t(2, 700)], 1000);
+    const ordered = drawdown([t(1, 0), t(2, -300), t(3, 0)], 1000);
+    const shuffled = drawdown([t(3, 0), t(1, 0), t(2, -300)], 1000);
     expect(shuffled.maxDrawdown).toBe(ordered.maxDrawdown);
     expect(shuffled.maxDrawdown).toBe(300);
   });
 
   it('reports no drawdown for a curve that only rises', () => {
-    const d = drawdown([t(1, 1100), t(2, 1200)], 1000);
+    const d = drawdown([t(1, 100), t(2, 200)], 1000);
+    expect(d.maxDrawdown).toBe(0);
+    expect(d.maxDrawdownPct).toBe(0);
+  });
+
+  it('ignores cash spent opening a position — deploying capital is not a loss', () => {
+    // Two entries that spend cash but realise nothing. availableBalance would
+    // have fallen by the full cost; realised equity has not moved.
+    const d = drawdown([t(1, 0), t(2, 0)], 1000);
     expect(d.maxDrawdown).toBe(0);
     expect(d.maxDrawdownPct).toBe(0);
   });
